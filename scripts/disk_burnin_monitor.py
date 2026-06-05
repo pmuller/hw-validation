@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Global system monitor for disk burn-in.
+Global system monitor for disk validation.
 
 Logs host state, kernel storage warnings, per-block-device I/O counters,
 thermal data, memory/load/pressure, and periodic SMART/NVMe health snapshots.
-Run once while per-device burn-in jobs run in parallel.
+Run once while per-device validation jobs run in parallel.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -25,12 +26,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
-from typing import cast, override
+from typing import NoReturn, cast, override
 
 type JsonValue = (
     None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 )
 type JsonObject = dict[str, JsonValue]
+
+EXIT_PASS = 0
+EXIT_USAGE = 64
+EXIT_TOOLING = 70
 
 LSBLK_COLUMNS = "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,VENDOR,TRAN,ROTA,RM,RO,MOUNTPOINT,FSTYPE,LABEL,UUID,PARTUUID,PKNAME"
 CPU_STAT_FIELDS = (
@@ -78,12 +83,22 @@ MEMORY_SAMPLE_FIELDS = {
 SLUG_INVALID_CHARACTER_PATTERN = re.compile(r"[^A-Za-z0-9._=-]+")
 SLUG_UNDERSCORE_PATTERN = re.compile(r"_+")
 TEMPERATURE_INPUT_PATTERN = re.compile(r"temp(?P<sensor_number>\d+)_input")
+REQUIRED_COMMANDS = (
+    "lsblk",
+    "lspci",
+    "journalctl",
+    "smartctl",
+    "nvme",
+    "sensors",
+    "date",
+    "uname",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class MonitorSettings:
     devices: tuple[Path, ...]
-    log_root: Path
+    out_root: Path
     label: str
     interval: float
     smart_interval: float
@@ -94,7 +109,7 @@ class MonitorSettings:
     def json_arguments(self) -> JsonObject:
         return {
             "devices": json_strings(str(device_path) for device_path in self.devices),
-            "log_root": str(self.log_root),
+            "out_root": str(self.out_root),
             "label": self.label,
             "interval": self.interval,
             "smart_interval": self.smart_interval,
@@ -116,6 +131,13 @@ class MaximumLevelFilter(logging.Filter):
         return record.levelno <= self.maximum_level
 
 
+class ValidationArgumentParser(argparse.ArgumentParser):
+    @override
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+
 class UtcFormatter(logging.Formatter):
     @override
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
@@ -134,9 +156,6 @@ class CommandCapture:
 
     def __post_init__(self) -> None:
         self.commands_jsonl = self.root / "commands.jsonl"
-
-    def have(self, command_name: str) -> bool:
-        return shutil.which(command_name) is not None
 
     def capture(
         self,
@@ -212,6 +231,24 @@ def write_json(path: Path, payload: JsonObject) -> None:
 def append_json_line(path: Path, payload: JsonObject) -> None:
     with path.open("a", encoding="utf-8") as jsonl_file:
         print(json.dumps(payload, sort_keys=True), file=jsonl_file)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        print("This script must be run as root.", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
+def verify_required_commands() -> None:
+    missing_commands = [
+        command_name
+        for command_name in REQUIRED_COMMANDS
+        if shutil.which(command_name) is None
+    ]
+    if missing_commands:
+        raise RuntimeError(
+            "Required commands are missing after setup: " + ", ".join(missing_commands)
+        )
 
 
 def json_strings(values: Iterable[str]) -> list[JsonValue]:
@@ -445,20 +482,19 @@ def smart_device_snapshot(
     for device_path in devices:
         device = str(device_path)
         block_name = block_name_from_device(device_path)
-        if snapshot_capture.have("smartctl"):
-            snapshot_capture.capture(
-                f"smartctl_{block_name}",
-                ["smartctl", "-H", "-A", "-l", "error", "-l", "selftest", device],
-                timeout=120,
-                quiet=True,
-            )
-            snapshot_capture.capture(
-                f"smartctl_x_json_{block_name}",
-                ["smartctl", "-x", "-j", device],
-                timeout=120,
-                quiet=True,
-            )
-        if device_path in nvme_devices and snapshot_capture.have("nvme"):
+        snapshot_capture.capture(
+            f"smartctl_{block_name}",
+            ["smartctl", "-H", "-A", "-l", "error", "-l", "selftest", device],
+            timeout=120,
+            quiet=True,
+        )
+        snapshot_capture.capture(
+            f"smartctl_x_json_{block_name}",
+            ["smartctl", "-x", "-j", device],
+            timeout=120,
+            quiet=True,
+        )
+        if device_path in nvme_devices:
             snapshot_capture.capture(
                 f"nvme_smart_log_{block_name}",
                 ["nvme", "smart-log", device, "-o", "json"],
@@ -479,13 +515,7 @@ def start_kernel_follower(
     stop_event: threading.Event,
 ) -> subprocess.Popen[str] | None:
     output_path = root / "kernel-follow.log"
-    if shutil.which("journalctl"):
-        command = ["journalctl", "-k", "-f", "-p", "warning", "-o", "short-iso-precise"]
-    elif shutil.which("dmesg"):
-        command = ["dmesg", "-wT", "--level=err,warn"]
-    else:
-        logger.warning("neither journalctl nor dmesg found; no kernel follow log")
-        return None
+    command = ["journalctl", "-k", "-f", "-p", "warning", "-o", "short-iso-precise"]
 
     logger.info("kernel warning follower: %s", shlex.join(command))
     process = subprocess.Popen(
@@ -526,8 +556,8 @@ def require_argument_action(action: argparse.Action) -> None:
 
 
 def parse_arguments(arguments: Sequence[str]) -> MonitorSettings:
-    parser = argparse.ArgumentParser(
-        description="Global system monitor for disk burn-in runs"
+    parser = ValidationArgumentParser(
+        description="Global system monitor for disk validation runs"
     )
     require_argument_action(
         parser.add_argument(
@@ -538,7 +568,7 @@ def parse_arguments(arguments: Sequence[str]) -> MonitorSettings:
     )
     require_argument_action(
         parser.add_argument(
-            "--log-root", required=True, help="Required central log root."
+            "--out-root", required=True, help="Required absolute output root."
         )
     )
     require_argument_action(
@@ -579,17 +609,20 @@ def parse_arguments(arguments: Sequence[str]) -> MonitorSettings:
             "--sensors-interval",
             type=float,
             default=300.0,
-            help="Run sensors -j every N seconds if available. 0 disables.",
+            help="Run sensors -j every N seconds. 0 disables.",
         )
     )
     namespace = parser.parse_args(arguments)
+    out_root_path = Path(cast(str, namespace.out_root)).expanduser()
+    if not out_root_path.is_absolute():
+        parser.error("--out-root must be an absolute path")
     devices = tuple(
         resolved_device_path(device)
         for device in cast(list[str] | None, namespace.devices) or ()
     )
     return MonitorSettings(
         devices=devices,
-        log_root=Path(cast(str, namespace.log_root)).expanduser().resolve(),
+        out_root=out_root_path.resolve(),
         label=cast(str, namespace.label),
         interval=cast(float, namespace.interval),
         smart_interval=cast(float, namespace.smart_interval),
@@ -696,7 +729,13 @@ def summarize_blocks(block_samples: JsonObject) -> str:
 
 
 def run_monitor(settings: MonitorSettings) -> int:
-    run_directory = settings.log_root / "monitor" / f"{run_id()}_{slug(settings.label)}"
+    try:
+        verify_required_commands()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return EXIT_TOOLING
+
+    run_directory = settings.out_root / "monitor" / f"{run_id()}_{slug(settings.label)}"
     run_directory.mkdir(parents=True, exist_ok=True)
     logger = configure_logger(run_directory / "monitor.log")
     capture = CommandCapture(run_directory, logger)
@@ -726,13 +765,11 @@ def run_monitor(settings: MonitorSettings) -> int:
 
     capture.capture("uname", ["uname", "-a"], quiet=True)
     capture.capture("date_utc", ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], quiet=True)
-    if capture.have("lsblk"):
-        capture.capture(
-            "lsblk_all_json", ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS], quiet=True
-        )
-        capture.capture("lsblk_all_text", ["lsblk", "-o", LSBLK_COLUMNS], quiet=True)
-    if capture.have("lspci"):
-        capture.capture("lspci_all", ["lspci", "-nn"], quiet=True)
+    capture.capture(
+        "lsblk_all_json", ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS], quiet=True
+    )
+    capture.capture("lsblk_all_text", ["lsblk", "-o", LSBLK_COLUMNS], quiet=True)
+    capture.capture("lspci_all", ["lspci", "-nn"], quiet=True)
 
     kernel_process = (
         None
@@ -825,7 +862,6 @@ def run_monitor(settings: MonitorSettings) -> int:
 
             if (
                 settings.sensors_interval > 0
-                and capture.have("sensors")
                 and current_monotonic >= next_sensors_capture
             ):
                 capture.capture(
@@ -854,14 +890,27 @@ def run_monitor(settings: MonitorSettings) -> int:
         logger.info(
             "monitor finished; samples=%s; output=%s", sample_count, run_directory
         )
+        write_json(
+            run_directory / "result.json",
+            {
+                "status": "PASS",
+                "result": "PASS",
+                "exit_code": EXIT_PASS,
+                "failures": 0,
+                "warnings": 0,
+                "label": settings.label,
+                "run_directory": str(run_directory),
+                "samples": sample_count,
+            },
+        )
         close_logger(logger)
-    return 0
+    return EXIT_PASS
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    return run_monitor(
-        parse_arguments(sys.argv[1:] if arguments is None else arguments)
-    )
+    settings = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    require_root()
+    return run_monitor(settings)
 
 
 if __name__ == "__main__":

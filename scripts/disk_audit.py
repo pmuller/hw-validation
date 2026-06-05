@@ -2,8 +2,8 @@
 """
 Disk audit collector.
 
-Non-destructive inventory/snapshot tool for HDD/NVMe burn-in workflows.
-Collects lsblk, udev, SMART, NVMe, and optional tool output into a timestamped
+Non-destructive inventory/snapshot tool for HDD/NVMe validation workflows.
+Collects lsblk, udev, SMART, and NVMe output into a timestamped
 log directory and emits a manifest for later comparison.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import shutil
@@ -20,12 +21,17 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast, override
 
 type JsonValue = (
     None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 )
 type JsonObject = dict[str, JsonValue]
+
+EXIT_PASS = 0
+EXIT_WARN = 2
+EXIT_USAGE = 64
+EXIT_TOOLING = 70
 
 LSBLK_COLUMNS = "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,WWN,VENDOR,TRAN,ROTA,RM,RO,MOUNTPOINT,FSTYPE,LABEL,UUID,PARTUUID,PKNAME"
 SLUG_INVALID_CHARACTER_PATTERN = re.compile(r"[^A-Za-z0-9._=-]+")
@@ -48,6 +54,19 @@ NVME_HEALTH_KEYS = (
     "num_err_log_entries",
 )
 UDEV_SLUG_KEYS = ("ID_SERIAL_SHORT", "ID_SERIAL", "ID_WWN", "ID_MODEL")
+REQUIRED_COMMANDS = (
+    "lsblk",
+    "lspci",
+    "dmesg",
+    "journalctl",
+    "smartctl",
+    "nvme",
+    "blockdev",
+    "wipefs",
+    "hdparm",
+    "sg_vpd",
+    "udevadm",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +75,16 @@ class AuditSettings:
     audit_all: bool
     include_removable: bool
     include_readonly: bool
-    log_root: Path
+    out_root: Path
     label: str
     quiet: bool
+
+
+class ValidationArgumentParser(argparse.ArgumentParser):
+    @override
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
 @dataclass(slots=True)
@@ -170,6 +196,24 @@ def slug(value: str, maximum_length: int = 120) -> str:
 
 def audit_log(message: str) -> None:
     print(f"{utc_now()} [audit] {message}", file=sys.stderr, flush=True)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        print("This script must be run as root.", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
+def verify_required_commands() -> None:
+    missing_commands = [
+        command_name
+        for command_name in REQUIRED_COMMANDS
+        if shutil.which(command_name) is None
+    ]
+    if missing_commands:
+        raise RuntimeError(
+            "Required commands are missing after setup: " + ", ".join(missing_commands)
+        )
 
 
 def write_text(path: Path, text: str) -> None:
@@ -419,26 +463,22 @@ def device_directory_name(device: Path, udev_properties: dict[str, str]) -> str:
 def capture_global_context(runner: CommandRunner) -> None:
     runner.record("uname", ["uname", "-a"])
     runner.record("date_utc", ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"])
-    if runner.have("lsblk"):
-        runner.record("lsblk_all_json", ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS])
-        runner.record("lsblk_all_text", ["lsblk", "-o", LSBLK_COLUMNS])
-    if runner.have("lspci"):
-        runner.record("lspci_storage", ["lspci", "-nn"])
-    if runner.have("dmesg"):
-        runner.record("dmesg_recent", ["dmesg", "-T"])
-    if runner.have("journalctl"):
-        runner.record(
-            "journalctl_kernel_recent",
-            [
-                "journalctl",
-                "-k",
-                "--no-pager",
-                "-o",
-                "short-iso-precise",
-                "--since",
-                "24 hours ago",
-            ],
-        )
+    runner.record("lsblk_all_json", ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS])
+    runner.record("lsblk_all_text", ["lsblk", "-o", LSBLK_COLUMNS])
+    runner.record("lspci_storage", ["lspci", "-nn"])
+    runner.record("dmesg_recent", ["dmesg", "-T"])
+    runner.record(
+        "journalctl_kernel_recent",
+        [
+            "journalctl",
+            "-k",
+            "--no-pager",
+            "-o",
+            "short-iso-precise",
+            "--since",
+            "24 hours ago",
+        ],
+    )
 
 
 def capture_device_details(
@@ -449,40 +489,30 @@ def capture_device_details(
 ) -> JsonObject:
     smart_json: JsonObject | None = None
     device_text = str(device)
-    if runner.have("smartctl"):
-        completed_process = runner.capture(
-            "smartctl_x_json", ["smartctl", "-x", "-j", device_text]
-        )
-        smart_json = json_object(parse_json(completed_process.stdout))
-        runner.record("smartctl_x_text", ["smartctl", "-x", device_text])
-        runner.record(
-            "smartctl_health_attrs_logs",
-            ["smartctl", "-H", "-A", "-l", "error", "-l", "selftest", device_text],
-        )
-    else:
-        audit_log("smartctl not found; SMART data not collected")
+    completed_process = runner.capture(
+        "smartctl_x_json", ["smartctl", "-x", "-j", device_text]
+    )
+    smart_json = json_object(parse_json(completed_process.stdout))
+    runner.record("smartctl_x_text", ["smartctl", "-x", device_text])
+    runner.record(
+        "smartctl_health_attrs_logs",
+        ["smartctl", "-H", "-A", "-l", "error", "-l", "selftest", device_text],
+    )
 
     if is_nvme_device(device, nodes, udev_properties):
         capture_nvme_details(runner, device)
     else:
         capture_non_nvme_details(runner, device)
 
-    for optional_command in (
+    for extra_command in (
         ["blockdev", "--getsize64", device_text],
         ["wipefs", "--no-act", device_text],
     ):
-        if runner.have(optional_command[0]):
-            runner.record(
-                "_".join(optional_command[:2]).replace("-", ""), optional_command
-            )
+        runner.record("_".join(extra_command[:2]).replace("-", ""), extra_command)
     return smart_identity(smart_json)
 
 
 def capture_nvme_details(runner: CommandRunner, device: Path) -> None:
-    if not runner.have("nvme"):
-        audit_log("nvme-cli not found; NVMe-specific logs not collected")
-        return
-
     device_text = str(device)
     controller = nvme_controller_for(device)
     runner.record("nvme_list_json", ["nvme", "list", "-o", "json"])
@@ -508,12 +538,8 @@ def capture_nvme_details(runner: CommandRunner, device: Path) -> None:
 
 def capture_non_nvme_details(runner: CommandRunner, device: Path) -> None:
     device_text = str(device)
-    if runner.have("hdparm"):
-        runner.record("hdparm_identify", ["hdparm", "-I", device_text])
-    if runner.have("sg_vpd"):
-        runner.record("sg_vpd_all", ["sg_vpd", "-a", device_text])
-    if runner.have("sdparm"):
-        runner.record("sdparm_all", ["sdparm", "--all", device_text])
+    runner.record("hdparm_identify", ["hdparm", "-I", device_text])
+    runner.record("sg_vpd_all", ["sg_vpd", "-a", device_text])
 
 
 def audit_device(
@@ -524,12 +550,11 @@ def audit_device(
     top_level = top_level_nodes[0] if top_level_nodes else {}
 
     udev_properties: dict[str, str] = {}
-    if runner.have("udevadm"):
-        completed_process = runner.capture(
-            "udevadm_info",
-            ["udevadm", "info", "--query=property", "--name", str(device)],
-        )
-        udev_properties = parse_udev_properties(completed_process.stdout)
+    completed_process = runner.capture(
+        "udevadm_info",
+        ["udevadm", "info", "--query=property", "--name", str(device)],
+    )
+    udev_properties = parse_udev_properties(completed_process.stdout)
 
     device_directory = run_directory / device_directory_name(device, udev_properties)
     device_directory.mkdir(parents=True, exist_ok=True)
@@ -537,11 +562,10 @@ def audit_device(
     device_runner.record(
         "lsblk_device_json", ["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS, str(device)]
     )
-    if runner.have("udevadm"):
-        device_runner.record(
-            "udevadm_info",
-            ["udevadm", "info", "--query=property", "--name", str(device)],
-        )
+    device_runner.record(
+        "udevadm_info",
+        ["udevadm", "info", "--query=property", "--name", str(device)],
+    )
 
     identity = capture_device_details(device_runner, device, nodes, udev_properties)
     detected_nvme = is_nvme_device(device, nodes, udev_properties)
@@ -566,7 +590,9 @@ def require_argument_action(action: argparse.Action) -> None:
 
 
 def parse_arguments(arguments: Sequence[str]) -> AuditSettings:
-    parser = argparse.ArgumentParser(description="Non-destructive disk audit collector")
+    parser = ValidationArgumentParser(
+        description="Non-destructive disk audit collector"
+    )
     require_argument_action(
         parser.add_argument(
             "--devices",
@@ -597,7 +623,7 @@ def parse_arguments(arguments: Sequence[str]) -> AuditSettings:
     )
     require_argument_action(
         parser.add_argument(
-            "--log-root", required=True, help="Required central log root."
+            "--out-root", required=True, help="Required absolute output root."
         )
     )
     require_argument_action(
@@ -617,12 +643,15 @@ def parse_arguments(arguments: Sequence[str]) -> AuditSettings:
     audit_all = cast(bool, namespace.all)
     if not devices and not audit_all:
         parser.error("provide --devices ... or --all")
+    out_root_path = Path(cast(str, namespace.out_root)).expanduser()
+    if not out_root_path.is_absolute():
+        parser.error("--out-root must be an absolute path")
     return AuditSettings(
         devices=devices,
         audit_all=audit_all,
         include_removable=cast(bool, namespace.include_removable),
         include_readonly=cast(bool, namespace.include_readonly),
-        log_root=Path(cast(str, namespace.log_root)).expanduser().resolve(),
+        out_root=out_root_path.resolve(),
         label=cast(str, namespace.label),
         quiet=cast(bool, namespace.quiet),
     )
@@ -669,7 +698,16 @@ def inventory_table(manifest: list[JsonObject]) -> str:
 
 
 def run_audit(settings: AuditSettings) -> int:
-    run_directory = settings.log_root / "audit" / f"{run_id()}_{slug(settings.label)}"
+    if not settings.out_root.is_absolute():
+        audit_log("--out-root must be an absolute path")
+        return EXIT_USAGE
+    try:
+        verify_required_commands()
+    except RuntimeError as error:
+        audit_log(str(error))
+        return EXIT_TOOLING
+
+    run_directory = settings.out_root / "audit" / f"{run_id()}_{slug(settings.label)}"
     run_directory.mkdir(parents=True, exist_ok=True)
     runner = CommandRunner(run_directory, verbose=not settings.quiet)
 
@@ -679,7 +717,20 @@ def run_audit(settings: AuditSettings) -> int:
     devices = discover_devices(runner, settings)
     if not devices:
         audit_log("no devices discovered")
-        return 2
+        write_json(
+            run_directory / "result.json",
+            {
+                "status": "WARN",
+                "result": "WARN",
+                "exit_code": EXIT_WARN,
+                "failures": 0,
+                "warnings": 1,
+                "label": settings.label,
+                "run_directory": str(run_directory),
+                "message": "no devices discovered",
+            },
+        )
+        return EXIT_WARN
     audit_log(
         f"auditing {len(devices)} device(s): {' '.join(str(device) for device in devices)}"
     )
@@ -699,13 +750,28 @@ def run_audit(settings: AuditSettings) -> int:
             print(json.dumps(row, sort_keys=True), file=jsonl_file)
 
     write_text(run_directory / "inventory.tsv", inventory_table(manifest))
+    write_json(
+        run_directory / "result.json",
+        {
+            "status": "PASS",
+            "result": "PASS",
+            "exit_code": EXIT_PASS,
+            "failures": 0,
+            "warnings": 0,
+            "label": settings.label,
+            "run_directory": str(run_directory),
+            "devices": len(devices),
+        },
+    )
     audit_log(f"wrote manifest: {run_directory / 'manifest.json'}")
     audit_log(f"wrote inventory: {run_directory / 'inventory.tsv'}")
     return 0
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    return run_audit(parse_arguments(sys.argv[1:] if arguments is None else arguments))
+    settings = parse_arguments(sys.argv[1:] if arguments is None else arguments)
+    require_root()
+    return run_audit(settings)
 
 
 if __name__ == "__main__":

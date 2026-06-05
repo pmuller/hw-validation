@@ -6,9 +6,11 @@
 set -Euo pipefail
 shopt -s nullglob
 
+EXIT_USAGE=64
+EXIT_TOOLING=70
 VERSION="$(git -C "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" describe --always --dirty)"
 DEVICE=""
-LOG_ROOT=""
+OUT_ROOT=""
 BURNIN_ROOT=""
 ERASE_OK=0
 DRY_RUN=0
@@ -35,14 +37,14 @@ LOCK_FD=9
 usage() {
   cat <<'EOF'
 Usage:
-  sudo ./disk_burnin_device.sh --device /dev/disk/by-id/... --i-know-this-erases-data [options]
+  ./scripts/disk_burnin_device.sh --device /dev/disk/by-id/... --out-root /absolute/path --i-know-this-erases-data [options]
 
 Required:
   --device PATH                 Whole block device or stable /dev/disk/by-id path.
+  --out-root DIR                Required absolute output root. Burn-in logs go under DIR/burnin.
   --i-know-this-erases-data     Required unless --dry-run is used.
 
 Options:
-  --log-root DIR                Required central log root. Burn-in logs go under DIR/burnin.
   --kind auto|hdd|ssd|nvme      Override device kind detection. Default: auto
   --hdd-method badblocks|fio    HDD destructive method. Default: badblocks
   --smartctl-type TYPE          Pass smartctl -d TYPE, e.g. sat, scsi, megaraid,N
@@ -73,8 +75,8 @@ while [[ $# -gt 0 ]]; do
     DEVICE="${2:-}"
     shift 2
     ;;
-  --log-root)
-    LOG_ROOT="${2:-}"
+  --out-root)
+    OUT_ROOT="${2:-}"
     shift 2
     ;;
   --kind)
@@ -144,18 +146,22 @@ while [[ $# -gt 0 ]]; do
   *)
     echo "Unknown argument: $1" >&2
     usage >&2
-    exit 2
+    exit "$EXIT_USAGE"
     ;;
   esac
 done
 
-if [[ -z "$LOG_ROOT" ]]; then
-  echo "--log-root is required" >&2
-  exit 2
+if [[ -z "$OUT_ROOT" ]]; then
+  echo "--out-root is required" >&2
+  exit "$EXIT_USAGE"
 fi
-BURNIN_ROOT="$LOG_ROOT/burnin"
+if [[ "$OUT_ROOT" != /* ]]; then
+  echo "--out-root must be an absolute path" >&2
+  exit "$EXIT_USAGE"
+fi
+BURNIN_ROOT="$OUT_ROOT/burnin"
 
-ts() { date -Is; }
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 ts_file() { date -u +%Y%m%dT%H%M%SZ; }
 
 log_raw() {
@@ -175,7 +181,7 @@ warn() {
 }
 die() {
   log_raw ERROR "$@" >&2
-  exit 2
+  exit "$EXIT_USAGE"
 }
 mark_fail() {
   FAILURES=$((FAILURES + 1))
@@ -578,17 +584,17 @@ final_health_check() {
 }
 
 [[ -n "$DEVICE" ]] || {
-  usage >&2
-  exit 2
+    usage >&2
+  exit "$EXIT_USAGE"
 }
 case "$KIND" in auto | hdd | ssd | nvme) ;; *)
   echo "Invalid --kind: $KIND" >&2
-  exit 2
+  exit "$EXIT_USAGE"
   ;;
 esac
 case "$HDD_METHOD" in badblocks | fio) ;; *)
   echo "Invalid --hdd-method: $HDD_METHOD" >&2
-  exit 2
+  exit "$EXIT_USAGE"
   ;;
 esac
 require_integer --ssd-full-passes "$SSD_FULL_PASSES"
@@ -606,27 +612,28 @@ need_cmd date
 need_cmd flock
 need_cmd jq
 need_cmd smartctl
+need_cmd nvme
 select_fio_binary
 if [[ "$HDD_METHOD" == "badblocks" ]]; then need_cmd badblocks; fi
 if [[ "$DRY_RUN" -ne 1 && "$ERASE_OK" -ne 1 ]]; then
   echo "Refusing to run destructive burn-in without --i-know-this-erases-data" >&2
-  exit 2
+  exit "$EXIT_USAGE"
 fi
 if [[ "$EUID" -ne 0 ]]; then
-  echo "Run as root. This script needs raw block-device and SMART/NVMe access." >&2
-  exit 2
+  echo "This script must be run as root." >&2
+  exit "$EXIT_USAGE"
 fi
 
 REAL_DEVICE="$(readlink -f "$DEVICE")"
 [[ -b "$REAL_DEVICE" ]] || {
   echo "Not a block device: $DEVICE -> $REAL_DEVICE" >&2
-  exit 2
+  exit "$EXIT_USAGE"
 }
 KNAME="$(basename "$REAL_DEVICE")"
 TYPE="$(lsblk -dnro TYPE "$REAL_DEVICE" 2>/dev/null || true)"
 [[ "$TYPE" == "disk" ]] || {
   echo "Refusing: target must be a whole disk/namespace, not type '$TYPE': $REAL_DEVICE" >&2
-  exit 2
+  exit "$EXIT_USAGE"
 }
 TRAN="$(lsblk -dnro TRAN "$REAL_DEVICE" 2>/dev/null | tr -d ' ' || true)"
 ROTA="$(lsblk -dnro ROTA "$REAL_DEVICE" 2>/dev/null | tr -d ' ' || true)"
@@ -673,10 +680,6 @@ else
 fi
 log "detected_kind=$DETECTED_KIND"
 
-if [[ "$DETECTED_KIND" == "nvme" ]] && ! command -v nvme >/dev/null 2>&1; then
-  warn "nvme-cli is not installed; NVMe-specific logs and self-tests will be skipped. Install nvme-cli."
-fi
-
 {
   echo "RUN_ID=$RUN_ID"
   echo "VERSION=$VERSION"
@@ -704,7 +707,7 @@ run_smartctl -s on -S on -o on || warn "SMART enable/autosave/offline command fa
 
 case "$DETECTED_KIND" in
 hdd)
-  log "Burn-in plan: HDD => optional conveyance + short SMART, destructive full-surface write/read, randread stress, final long SMART"
+  log "Burn-in plan: HDD => conveyance + short SMART when supported, destructive full-surface write/read, randread stress, final long SMART"
   if [[ "$SKIP_SELFTESTS" -ne 1 ]]; then
     maybe_run_conveyance
     run_smartctl_selftest short 7200
