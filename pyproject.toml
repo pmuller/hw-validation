@@ -1,0 +1,62 @@
+[project]
+name = "hw-validation"
+version = "0.1.0"
+description = "Generic Linux hardware validation toolkit"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "rich>=13.7.1",
+  "typer>=0.12.5",
+]
+
+[project.scripts]
+hw-validation = "hw_validation.cli:main_entry"
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.21.0",
+  "pytest>=8.3.0",
+  "ruff>=0.8.0",
+  "shiv>=1.0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "SIM", "UP"]
+ignore = [
+  "COM812",
+  "E501",
+  "D100",
+  "D101",
+  "D102",
+  "D103",
+  "D104",
+  "D107",
+  "ISC001",
+  "S603",
+  "S607",
+  "T201",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.basedpyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "all"
+reportAny = "error"
+reportExplicitAny = "error"
+reportImplicitOverride = "error"
+reportUnusedCallResult = "error"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

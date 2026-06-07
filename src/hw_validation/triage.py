@@ -1,28 +1,16 @@
-#!/usr/bin/env python3
-"""Scan validation logs and classify hardware-validation findings."""
-
 from __future__ import annotations
 
-import argparse
-import json
 import re
-import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import NoReturn, cast, override
 
-type JsonValue = (
-    None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
-)
-type JsonObject = dict[str, JsonValue]
-
-EXIT_PASS = 0
-EXIT_FAIL = 1
-EXIT_WARN = 2
-EXIT_USAGE = 64
-EXIT_TOOLING = 70
+from hw_validation.files import write_json, write_text
+from hw_validation.json_types import JsonObject
+from hw_validation.paths import path_is_within
+from hw_validation.status import ExitCode, ResultStatus
+from hw_validation.timeutil import elapsed_seconds, utc_now
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,19 +19,6 @@ class TriagePattern:
     category: str
     severity: str
     expression: re.Pattern[str]
-
-
-@dataclass(frozen=True, slots=True)
-class TriageSettings:
-    log_root: Path
-    out_root: Path
-
-
-class ValidationArgumentParser(argparse.ArgumentParser):
-    @override
-    def error(self, message: str) -> NoReturn:
-        self.print_usage(sys.stderr)
-        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
 PATTERNS = (
@@ -128,10 +103,7 @@ PATTERNS = (
         "sata_link_reset",
         "storage",
         "failure",
-        re.compile(
-            r"SATA link reset|link is slow to respond|hard resetting link",
-            re.IGNORECASE,
-        ),
+        re.compile(r"SATA link reset|hard resetting link", re.IGNORECASE),
     ),
     TriagePattern(
         "ata_exception",
@@ -219,44 +191,6 @@ PATTERNS = (
 )
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as text_file:
-        print(text, file=text_file, end="")
-
-
-def write_json(path: Path, payload: JsonValue) -> None:
-    write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-
-def require_argument_action(action: argparse.Action) -> None:
-    if not action.dest:
-        raise RuntimeError("argparse returned an action without a destination")
-
-
-def require_absolute_path(path_text: str, argument_name: str) -> Path:
-    path = Path(path_text).expanduser()
-    if not path.is_absolute():
-        raise ValueError(f"{argument_name} must be an absolute path")
-    return path.resolve(strict=False)
-
-
-def path_is_within(path: Path, possible_parent: Path) -> bool:
-    return path.is_relative_to(possible_parent)
-
-
-def should_scan_file(file_path: Path, out_root: Path) -> bool:
-    if path_is_within(file_path, out_root):
-        return False
-    if file_path.is_dir():
-        return False
-    return True
-
-
 def finding(
     pattern: TriagePattern, file_path: Path, line_number: int, line: str
 ) -> JsonObject:
@@ -270,61 +204,56 @@ def finding(
     }
 
 
-def scan_file(file_path: Path) -> tuple[list[JsonObject], JsonObject | None]:
+def scan_file(file_path: Path) -> list[JsonObject]:
     findings: list[JsonObject] = []
-    try:
-        with file_path.open("r", encoding="utf-8", errors="replace") as log_file:
-            for line_number, line in enumerate(log_file, start=1):
-                for pattern in PATTERNS:
-                    if pattern.expression.search(line):
-                        findings.append(finding(pattern, file_path, line_number, line))
-    except PermissionError as error:
-        return findings, {
-            "file_path": str(file_path),
-            "line_number": 0,
-            "severity": "failure",
-            "category": "permission",
-            "pattern": "permission_denied",
-            "matched_text": str(error),
-        }
-    except OSError as error:
-        return findings, {
-            "file_path": str(file_path),
-            "line_number": 0,
-            "severity": "warning",
-            "category": "read-error",
-            "pattern": "read_error",
-            "matched_text": str(error),
-        }
-    return findings, None
+    with file_path.open("r", encoding="utf-8", errors="replace") as log_file:
+        for line_number, line in enumerate(log_file, start=1):
+            for pattern in PATTERNS:
+                if pattern.expression.search(line):
+                    findings.append(finding(pattern, file_path, line_number, line))
+    return findings
 
 
-def scan_logs(settings: TriageSettings) -> list[JsonObject]:
-    if not settings.log_root.exists():
-        raise FileNotFoundError(f"--log-root does not exist: {settings.log_root}")
-    all_findings: list[JsonObject] = []
-    for file_path in sorted(settings.log_root.rglob("*")):
-        if not should_scan_file(file_path, settings.out_root):
+def scan_logs(log_root: Path, out_root: Path) -> list[JsonObject]:
+    if not log_root.exists():
+        raise FileNotFoundError(f"--log-root does not exist: {log_root}")
+    findings: list[JsonObject] = []
+    for file_path in sorted(log_root.rglob("*")):
+        if file_path.is_dir() or path_is_within(file_path, out_root):
             continue
-        findings, scan_error = scan_file(file_path)
-        all_findings.extend(findings)
-        if scan_error is not None:
-            all_findings.append(scan_error)
-    return all_findings
+        try:
+            findings.extend(scan_file(file_path))
+        except PermissionError as error:
+            findings.append(
+                {
+                    "file_path": str(file_path),
+                    "line_number": 0,
+                    "severity": "failure",
+                    "category": "permission",
+                    "pattern": "permission_denied",
+                    "matched_text": str(error),
+                }
+            )
+        except OSError as error:
+            findings.append(
+                {
+                    "file_path": str(file_path),
+                    "line_number": 0,
+                    "severity": "warning",
+                    "category": "read-error",
+                    "pattern": "read_error",
+                    "matched_text": str(error),
+                }
+            )
+    return findings
 
 
-def status_for(findings: Sequence[JsonObject]) -> tuple[str, int]:
-    has_failure = any(
-        finding_item.get("severity") == "failure" for finding_item in findings
-    )
-    has_warning = any(
-        finding_item.get("severity") == "warning" for finding_item in findings
-    )
-    if has_failure:
-        return "FAIL", EXIT_FAIL
-    if has_warning:
-        return "WARN", EXIT_WARN
-    return "PASS", EXIT_PASS
+def status_for(findings: Sequence[JsonObject]) -> tuple[ResultStatus, int]:
+    if any(finding_item.get("severity") == "failure" for finding_item in findings):
+        return ResultStatus.fail, ExitCode.hard_failure.code
+    if any(finding_item.get("severity") == "warning" for finding_item in findings):
+        return ResultStatus.warn, ExitCode.warning.code
+    return ResultStatus.pass_status, ExitCode.pass_status.code
 
 
 def count_by_key(findings: Sequence[JsonObject], key: str) -> JsonObject:
@@ -334,6 +263,38 @@ def count_by_key(findings: Sequence[JsonObject], key: str) -> JsonObject:
         if isinstance(value, str):
             counts[value] = counts.get(value, 0) + 1
     return {count_key: count for count_key, count in sorted(counts.items())}
+
+
+def run_triage(log_root: Path, out_root: Path) -> int:
+    out_root.mkdir(parents=True, exist_ok=True)
+    started_monotonic = time.monotonic()
+    started_at = utc_now()
+    findings = scan_logs(log_root, out_root)
+    status, exit_code = status_for(findings)
+    summary: JsonObject = {
+        "status": status.value,
+        "result": status.value,
+        "exit_code": exit_code,
+        "started_at": started_at,
+        "ended_at": utc_now(),
+        "duration_seconds": elapsed_seconds(started_monotonic),
+        "completed_reason": "completed",
+        "log_root": str(log_root),
+        "out_root": str(out_root),
+        "failures": sum(
+            1 for finding_item in findings if finding_item.get("severity") == "failure"
+        ),
+        "warnings": sum(
+            1 for finding_item in findings if finding_item.get("severity") == "warning"
+        ),
+        "counts_by_category": count_by_key(findings, "category"),
+        "counts_by_pattern": count_by_key(findings, "pattern"),
+        "findings": [finding_item for finding_item in findings],
+    }
+    write_json(out_root / "triage_summary.json", summary)
+    write_json(out_root / "result.json", summary)
+    write_text(out_root / "triage_summary.md", markdown_summary(summary, findings))
+    return exit_code
 
 
 def markdown_summary(summary: JsonObject, findings: Sequence[JsonObject]) -> str:
@@ -368,87 +329,3 @@ def markdown_summary(summary: JsonObject, findings: Sequence[JsonObject]) -> str
 
 def markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")[:500]
-
-
-def run_triage(settings: TriageSettings) -> int:
-    settings.out_root.mkdir(parents=True, exist_ok=True)
-    started_at = utc_now()
-    findings: list[JsonObject]
-    try:
-        findings = scan_logs(settings)
-    except (FileNotFoundError, PermissionError, OSError) as error:
-        scan_error: JsonObject = {
-            "file_path": str(settings.log_root),
-            "line_number": 0,
-            "severity": "failure",
-            "category": "setup",
-            "pattern": "scan_error",
-            "matched_text": str(error),
-        }
-        findings = [
-            scan_error,
-        ]
-    status, exit_code = status_for(findings)
-    summary: JsonObject = {
-        "status": status,
-        "result": status,
-        "exit_code": exit_code,
-        "started_at": started_at,
-        "ended_at": utc_now(),
-        "log_root": str(settings.log_root),
-        "out_root": str(settings.out_root),
-        "failures": sum(
-            1 for finding_item in findings if finding_item.get("severity") == "failure"
-        ),
-        "warnings": sum(
-            1 for finding_item in findings if finding_item.get("severity") == "warning"
-        ),
-        "counts_by_category": count_by_key(findings, "category"),
-        "counts_by_pattern": count_by_key(findings, "pattern"),
-        "findings": cast(JsonValue, findings),
-    }
-    write_json(settings.out_root / "triage_summary.json", summary)
-    write_json(settings.out_root / "result.json", summary)
-    write_text(
-        settings.out_root / "triage_summary.md", markdown_summary(summary, findings)
-    )
-    print(f"{utc_now()} [INFO] RESULT={status} out_root={settings.out_root}")
-    return exit_code
-
-
-def parse_arguments(arguments: Sequence[str]) -> TriageSettings:
-    parser = ValidationArgumentParser(
-        description="Scan validation logs for hardware findings."
-    )
-    require_argument_action(
-        parser.add_argument(
-            "--log-root", required=True, help="Required absolute log root to scan."
-        )
-    )
-    require_argument_action(
-        parser.add_argument(
-            "--out-root", required=True, help="Required absolute output root."
-        )
-    )
-    namespace = parser.parse_args(arguments)
-    try:
-        return TriageSettings(
-            log_root=require_absolute_path(cast(str, namespace.log_root), "--log-root"),
-            out_root=require_absolute_path(cast(str, namespace.out_root), "--out-root"),
-        )
-    except ValueError as error:
-        parser.error(str(error))
-
-
-def main(arguments: Sequence[str] | None = None) -> int:
-    try:
-        return run_triage(
-            parse_arguments(sys.argv[1:] if arguments is None else arguments)
-        )
-    except PermissionError as error:
-        print(f"Permission denied: {error}", file=sys.stderr)
-        return EXIT_TOOLING
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

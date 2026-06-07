@@ -1,41 +1,81 @@
 # Hardware Validation Toolkit
 
-Linux hardware validation scripts for host audit, stress, scratch filesystem I/O, network burn-in, disk validation, log triage, and readiness reporting.
+One Python CLI for generic Linux hardware validation: host audit, stress, scratch filesystem I/O, network burn-in, disk validation, log triage, and readiness reporting.
 
-Run from the repository root. Become root first for scripts that require privileged hardware access.
+The `hw-validation` command can run from any directory. Become root first for commands that require privileged hardware access.
+
+Repository-root context is only required for development commands such as `uv run ...`, `make ...`, tests, and builds.
+
+## Development
+
+Run these commands from the repository root:
+
+```bash
+make sync
+make check
+```
+
+Common tasks:
+
+| Command | Purpose |
+|---|---|
+| `make help` | Show Make targets. |
+| `make format` | Format and auto-fix Python code. |
+| `make check` | Run lint, format check, typecheck, and tests. |
+| `make smoke` | Run CLI help smoke checks. |
+| `make build` | Build `dist/hw-validation.pyz` with shiv. |
 
 ## Setup
 
+From a development checkout, run this from the repository root because `uv run` reads `pyproject.toml` and `uv.lock`:
+
 ```bash
-./scripts/setup.sh --yes
+uv run hw-validation setup
 ```
 
 Dry-run without changing the host:
 
 ```bash
-./scripts/setup.sh --dry-run --yes
+uv run hw-validation setup --dry-run
 ```
 
-The installer uses one package set. Package installation failure is a setup failure.
+The setup command uses one Debian package set. Package installation failure is a setup failure.
 
-## Scripts
+`setup` always passes `-y` to `apt-get install` to avoid interactive package prompts.
 
-| Script | Purpose | Destructive |
+## Commands
+
+| Command | Purpose | Destructive |
 |---|---|---:|
-| `scripts/setup.sh` | Install the Debian validation toolchain and check scripts. | No |
-| `scripts/system_audit.py` | Capture host, firmware, CPU, memory, PCIe, network, sensor, and storage inventory. | No |
-| `scripts/system_stress.sh` | Run CPU, memory, kernel, EDAC/RAS/AER, and thermal stress validation. | No |
-| `scripts/filesystem_scratch_test.sh` | Run fio write and verify jobs inside one script-created scratch directory. | Yes, inside scratch only |
-| `scripts/network_burnin.sh` | Run iperf3 network burn-in and compare NIC health counters. | No |
-| `scripts/log_triage.py` | Scan logs for hardware, kernel, storage, thermal, and network findings. | No |
-| `scripts/readiness_report.py` | Aggregate result files into final PASS, WARN, or FAIL readiness status. | No |
-| `scripts/disk_audit.py` | Existing disk inventory and SMART/NVMe audit. | No |
-| `scripts/disk_burnin_device.sh` | Existing destructive per-device disk validation runner. | Yes |
-| `scripts/disk_burnin_monitor.py` | Existing disk validation monitor for kernel warnings and device telemetry. | No |
+| `hw-validation setup` | Install and verify host tooling. | No |
+| `hw-validation system audit` | Capture host, firmware, CPU, memory, PCIe, network, sensor, and storage inventory. | No |
+| `hw-validation system stress` | Run CPU, memory, EDAC/RAS/AER, and thermal stress validation. | No |
+| `hw-validation filesystem scratch` | Run fio write and verify jobs inside one created scratch directory. | Yes, inside scratch only |
+| `hw-validation network burnin` | Run iperf3 network burn-in and compare NIC health counters. | No |
+| `hw-validation disk audit` | Capture disk inventory and SMART/NVMe state. | No |
+| `hw-validation disk burnin` | Run destructive per-device disk validation. | Yes |
+| `hw-validation disk monitor` | Capture disk validation telemetry. | No |
+| `hw-validation logs triage` | Scan logs for hardware, kernel, storage, thermal, and network findings. | No |
+| `hw-validation readiness report` | Aggregate final PASS, WARN, or FAIL readiness status. | No |
 
-Every script has `--help`.
+Every command has `--help`.
 
-Scripts that write artifacts require `--out-root /absolute/path`. `log_triage.py` and `readiness_report.py` also require `--log-root /absolute/path` as input.
+Commands that write artifacts require `--out-root /absolute/path`. `logs triage` and `readiness report` also require `--log-root /absolute/path` as input.
+
+## Duration And Timing
+
+Duration values are positive integers with an optional suffix: `s`, `m`, `h`, or `d`. A bare integer means seconds. Examples: `30s`, `5m`, `2h`, `1d`.
+
+Commands that run workloads write `plan.json`, per-command `*.meta.json` files, `timing_summary.json`, and `result.json` with `duration_seconds` and `completed_reason`.
+
+| Mode | Commands | Runtime behavior |
+|---|---|---|
+| Fast | `system audit`, `disk audit`, `logs triage`, `readiness report` | Runs collectors or scanners once. |
+| Bounded | `network burnin`, `disk monitor --duration` | Runs for the requested duration plus setup and teardown. |
+| Phase-bounded | `system stress --phase-duration` | Applies the duration to each stress phase, so total runtime is longer than one phase. |
+| Size-bound | `filesystem scratch --size` | Full-file phases depend on size and device speed; random phases use `--runtime`. |
+| Pass-bound | `disk burnin` | Full-device passes depend on disk size and speed; random read phases use `--ssd-randread-duration` or `--hdd-randread-duration` unless `--skip-randread` is set. |
+| Until interrupted | `disk monitor --until-interrupted` | Runs until interrupted and records `completed_reason` as `interrupted`. |
 
 ## Run Order
 
@@ -45,7 +85,7 @@ Scripts that write artifacts require `--out-root /absolute/path`. `log_triage.py
 4. System stress.
 5. Filesystem scratch test.
 6. Network burn-in.
-7. Existing disk validation, when storage validation is in scope.
+7. Disk validation, when storage validation is in scope.
 8. Post-system audit.
 9. Log triage.
 10. Readiness report.
@@ -55,18 +95,18 @@ Scripts that write artifacts require `--out-root /absolute/path`. `log_triage.py
 ```bash
 mkdir -p /var/log/hw-validation/2026-06-05-run01
 
-./scripts/system_audit.py \
+uv run hw-validation system audit \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label system-pre
 
-./scripts/system_stress.sh \
+uv run hw-validation system stress \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label system-24h \
-  --duration 24h
+  --phase-duration 24h
 
 mkdir -p /var/tmp/hw-validation-scratch
 
-./scripts/filesystem_scratch_test.sh \
+uv run hw-validation filesystem scratch \
   --path /var/tmp/hw-validation-scratch \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label filesystem-scratch \
@@ -84,7 +124,7 @@ iperf3 -s
 Back on this machine:
 
 ```bash
-./scripts/network_burnin.sh \
+uv run hw-validation network burnin \
   --server 192.0.2.10 \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label primary-network \
@@ -96,42 +136,58 @@ Back on this machine:
 Disk validation, when in scope:
 
 ```bash
-./scripts/disk_audit.py \
+uv run hw-validation disk audit \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label disk-pre \
   --all
 
-./scripts/disk_burnin_monitor.py \
+uv run hw-validation disk monitor \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label disk-monitor \
-  --interval 30 \
-  --smart-interval 300
+  --duration 24h \
+  --interval 30s \
+  --smart-interval 5m
 
-./scripts/disk_burnin_device.sh \
+uv run hw-validation disk burnin \
   --device /dev/disk/by-id/ata-EXAMPLE_DISK_SERIAL \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --ssd-randread-duration 60m \
+  --hdd-randread-duration 30m \
   --i-know-this-erases-data
 ```
+
+Use `--smartctl-type TYPE` on disk audit, burn-in, or monitor commands when a device requires `smartctl -d TYPE`, for example USB SAT bridges or RAID-backed devices.
 
 Finish:
 
 ```bash
-./scripts/system_audit.py \
+uv run hw-validation system audit \
   --out-root /var/log/hw-validation/2026-06-05-run01 \
   --label system-post
 
-./scripts/log_triage.py \
+uv run hw-validation logs triage \
   --log-root /var/log/hw-validation/2026-06-05-run01 \
-  --out-root /var/log/hw-validation/2026-06-05-run01/log-triage
+  --out-root /var/log/hw-validation/2026-06-05-run01/logs-triage
 
-./scripts/readiness_report.py \
+uv run hw-validation readiness report \
   --log-root /var/log/hw-validation/2026-06-05-run01 \
-  --out-root /var/log/hw-validation/2026-06-05-run01/readiness
+  --out-root /var/log/hw-validation/2026-06-05-run01/readiness-report
 ```
+
+## Deployment
+
+Build from the repository root:
+
+```bash
+make build
+python3 dist/hw-validation.pyz --help
+```
+
+Copy `dist/hw-validation.pyz` to the validation host after building.
 
 ## Results
 
-Every major script writes `result.json` under the explicit output root.
+Every major command writes `result.json` under the explicit output root.
 
 | Code | Meaning |
 |---:|---|
