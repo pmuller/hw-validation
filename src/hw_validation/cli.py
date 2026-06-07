@@ -10,6 +10,13 @@ from hw_validation.disk import run_disk_audit, run_disk_burnin, run_disk_monitor
 from hw_validation.filesystem import run_filesystem_scratch
 from hw_validation.network import run_network_burnin
 from hw_validation.paths import absolute_path
+from hw_validation.profile import (
+    ProfileSettings,
+    parse_parts,
+    parse_profile_name,
+    parse_profile_speed,
+    run_profile,
+)
 from hw_validation.readiness import run_report
 from hw_validation.root import require_root
 from hw_validation.setup_host import run_setup
@@ -70,6 +77,101 @@ def setup(
     if not dry_run:
         require_root()
     exit_with(run_setup(no_apt_update=no_apt_update, dry_run=dry_run))
+
+
+@application.command("run")
+def profile_run(
+    profile: Annotated[
+        str,
+        typer.Argument(help="Profile: smoke, standard, acceptance, or disk-burnin."),
+    ],
+    out_root: Annotated[str, typer.Option("--out-root", help="Absolute output root.")],
+    parts: Annotated[
+        str | None,
+        typer.Option(
+            "--parts",
+            help="Comma-separated parts: system, filesystem, network, disk, disk-burnin.",
+        ),
+    ] = None,
+    speed: Annotated[
+        str | None,
+        typer.Option(
+            "--speed", help="Bounded workload speed: smoke, standard, or long."
+        ),
+    ] = None,
+    plan_only: Annotated[
+        bool,
+        typer.Option("--plan-only", help="Write and print the profile plan only."),
+    ] = False,
+    resume: Annotated[
+        bool,
+        typer.Option("--resume", help="Skip profile steps with existing PASS results."),
+    ] = False,
+    scratch_path: Annotated[
+        str | None,
+        typer.Option(
+            "--scratch-path", help="Absolute scratch parent for filesystem validation."
+        ),
+    ] = None,
+    server: Annotated[
+        str | None,
+        typer.Option("--server", help="iperf3 server for network validation."),
+    ] = None,
+    interface: Annotated[
+        str | None, typer.Option("--interface", help="Network interface for burn-in.")
+    ] = None,
+    devices: Annotated[
+        list[str] | None,
+        typer.Option("--device", help="Disk device for disk parts. Repeatable."),
+    ] = None,
+    all_devices: Annotated[
+        bool,
+        typer.Option(
+            "--all-devices",
+            help="Use all discovered non-removable writable disks for disk-burnin.",
+        ),
+    ] = False,
+    smartctl_type: Annotated[
+        str | None,
+        typer.Option("--smartctl-type", help="Pass smartctl -d TYPE for disk SMART."),
+    ] = None,
+    erase_ok: Annotated[
+        bool,
+        typer.Option(
+            "--i-know-this-erases-data",
+            help="Required for the destructive disk-burnin profile or part.",
+        ),
+    ] = False,
+    cleanup: Annotated[
+        bool,
+        typer.Option("--cleanup/--no-cleanup", help="Clean profile scratch directory."),
+    ] = True,
+) -> None:
+    profile_name = parse_profile_name(profile)
+    if not plan_only:
+        require_root()
+    exit_with(
+        run_profile(
+            ProfileSettings(
+                profile=profile_name,
+                speed=parse_profile_speed(speed, profile_name),
+                out_root=absolute_path(out_root, "--out-root"),
+                parts=parse_parts(parts),
+                scratch_path=absolute_path(scratch_path, "--scratch-path")
+                if scratch_path is not None
+                else None,
+                server=server,
+                interface=interface,
+                devices=tuple(devices or ()),
+                all_devices=all_devices,
+                smartctl_type=smartctl_type,
+                erase_ok=erase_ok,
+                cleanup=cleanup,
+                plan_only=plan_only,
+                resume=resume,
+            )
+        )
+    )
 
 
 @system_application.command("audit")

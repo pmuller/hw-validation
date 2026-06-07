@@ -77,6 +77,94 @@ Commands that run workloads write `plan.json`, per-command `*.meta.json` files, 
 | Pass-bound | `disk burnin` | Full-device passes depend on disk size and speed; random read phases use `--ssd-randread-duration` or `--hdd-randread-duration` unless `--skip-randread` is set. |
 | Until interrupted | `disk monitor --until-interrupted` | Runs until interrupted and records `completed_reason` as `interrupted`. |
 
+## Profiles
+
+Use `run` when you want the toolkit to compose the sequence, write a manifest, run reports, and enforce expected coverage:
+
+```bash
+uv run hw-validation run smoke \
+  --out-root /var/log/hw-validation/2026-06-05-run01
+```
+
+Profiles:
+
+| Profile | Purpose |
+|---|---|
+| `smoke` | Short non-destructive validation: system audits, disk audit, disk monitor, triage, readiness. |
+| `standard` | Normal non-destructive validation: audits, stress, filesystem scratch, network burn-in, disk audit, disk monitor, reports. |
+| `acceptance` | Longer bounded validation using `long` durations. It still does not wipe disks by default. |
+| `disk-burnin` | Explicit destructive disk burn-in workflow. Requires exactly one `--device` or `--all-devices`, plus `--i-know-this-erases-data`. |
+
+Speeds apply only to bounded workloads such as stress, filesystem, network, and monitor:
+
+| Speed | Stress phase | Filesystem runtime | Network | Monitor |
+|---|---:|---:|---:|---:|
+| `smoke` | `5m` | `2m` | `2m` | `2m` |
+| `standard` | `1h` | `30m` | `1h` | `1h` |
+| `long` | `8h` | `2h` | `8h` | `8h` |
+
+Disk burn-in is not a speed. It is pass-bound and device-bound. A true burn-in for a large HDD can take a week or more.
+
+`--all-devices` is intentionally explicit. It discovers non-removable writable whole disks, writes each selected device into `profile_manifest.json`, runs the pre burn-in disk audit for those devices, preflights every selected disk for whole-disk, mounted descendant, active swap, and holder safety, then runs the destructive burn-in steps for the selected disks in parallel. Each disk is validated again by the normal per-device burn-in safety checks and per-device locking.
+
+`--all-devices` cannot be combined with `--resume`. Kernel device names are not stable enough to safely resume destructive all-device selection. If you need to resume after a partial all-device run, rerun the remaining disks explicitly with `--device /dev/disk/by-id/...`.
+
+Common profile examples:
+
+```bash
+uv run hw-validation run standard \
+  --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --scratch-path /var/tmp/hw-validation-scratch \
+  --server 192.0.2.10
+
+uv run hw-validation run acceptance \
+  --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --scratch-path /var/tmp/hw-validation-scratch \
+  --server 192.0.2.10 \
+  --speed long
+
+uv run hw-validation run disk-burnin \
+  --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --device /dev/disk/by-id/ata-EXAMPLE_DISK_SERIAL \
+  --i-know-this-erases-data
+
+uv run hw-validation run disk-burnin \
+  --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --all-devices \
+  --i-know-this-erases-data
+```
+
+Use `--parts` for targeted runs:
+
+```bash
+uv run hw-validation run standard \
+  --out-root /var/log/hw-validation/2026-06-05-run01 \
+  --parts system,disk-audit
+```
+
+Profile artifacts at the run root:
+
+| Artifact | Purpose |
+|---|---|
+| `profile_manifest.json` | Expected steps, labels, commands, selected profile, and speed. Written before execution. |
+| `profile_plan.md` | Human-readable plan. |
+| `report.json` | Profile-level execution summary. |
+| `report.md` | Profile-level human-readable report. |
+| `summary.txt` | One-screen status summary. |
+| `result.json` | Profile aggregate status. |
+
+Useful profile controls:
+
+| Option | Purpose |
+|---|---|
+| `--plan-only` | Write and print the plan without root or workloads. |
+| `--resume` | Skip profile steps that already have a matching `PASS` result for the expected step fingerprint. Not allowed with `--all-devices`. |
+| `--parts` | Select only some parts. |
+| `--speed` | Override bounded workload durations. |
+| `--all-devices` | For `disk-burnin`, discover all eligible disks and burn them in concurrently. |
+
+Readiness automatically checks `profile_manifest.json` when it exists. Missing required profile steps are reported as missing coverage instead of being silently ignored.
+
 ## Run Order
 
 1. Setup tooling.

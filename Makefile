@@ -35,6 +35,7 @@ check: lint typecheck test
 
 smoke:
 	uv run hw-validation --help >/tmp/hw-validation-help.txt
+	uv run hw-validation run --help >/tmp/hw-validation-run-help.txt
 	uv run hw-validation system --help >/tmp/hw-validation-system-help.txt
 	uv run hw-validation disk --help >/tmp/hw-validation-disk-help.txt
 	uv run hw-validation logs --help >/tmp/hw-validation-logs-help.txt

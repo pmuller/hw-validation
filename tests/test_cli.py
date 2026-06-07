@@ -13,6 +13,7 @@ from hw_validation.cli import application
         (("--help",), 0),
         (("setup", "--help"), 0),
         (("system", "--help"), 0),
+        (("run", "--help"), 0),
         (("disk", "--help"), 0),
         (("logs", "--help"), 0),
         (("readiness", "--help"), 0),

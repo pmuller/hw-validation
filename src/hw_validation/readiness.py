@@ -49,10 +49,17 @@ def result_record(path: Path, payload: JsonObject) -> JsonObject:
         "path": str(path),
         "status": result_status(payload).value,
         "label": payload.get("label", ""),
+        "profile_run_id": payload.get("profile_run_id", ""),
+        "profile_step_id": payload.get("profile_step_id", ""),
+        "profile_step_fingerprint": payload.get("profile_step_fingerprint", ""),
         "failures": payload.get("failures", 0),
         "warnings": payload.get("warnings", 0),
         "exit_code": payload.get("exit_code", 0),
     }
+
+
+def result_payload_is_component(payload: JsonObject) -> bool:
+    return payload.get("result_type") != "profile"
 
 
 def collect_result_files(
@@ -66,7 +73,9 @@ def collect_result_files(
         if path_is_within(result_path, out_root):
             continue
         try:
-            results.append(result_record(result_path, load_json(result_path)))
+            payload = load_json(result_path)
+            if result_payload_is_component(payload):
+                results.append(result_record(result_path, payload))
         except (OSError, ValueError, json.JSONDecodeError) as error:
             read_errors.append(
                 {"path": str(result_path), "status": "FAIL", "error": str(error)}
@@ -75,17 +84,120 @@ def collect_result_files(
 
 
 def final_status(
-    records: Sequence[JsonObject], read_errors: Sequence[JsonObject]
+    records: Sequence[JsonObject],
+    read_errors: Sequence[JsonObject],
+    missing_steps: Sequence[JsonObject],
 ) -> tuple[ResultStatus, int]:
-    if any(record.get("status") == "FAIL" for record in read_errors) or any(
-        record.get("status") == "FAIL" for record in records
+    if (
+        any(record.get("status") == "FAIL" for record in read_errors)
+        or any(record.get("status") == "FAIL" for record in records)
+        or any(step.get("required") is True for step in missing_steps)
     ):
         return ResultStatus.fail, ExitCode.hard_failure.code
-    if any(record.get("status") == "WARN" for record in read_errors) or any(
-        record.get("status") == "WARN" for record in records
+    if (
+        any(record.get("status") == "WARN" for record in read_errors)
+        or any(record.get("status") == "WARN" for record in records)
+        or missing_steps
     ):
         return ResultStatus.warn, ExitCode.warning.code
     return ResultStatus.pass_status, ExitCode.pass_status.code
+
+
+def load_profile_manifest(log_root: Path) -> JsonObject | None:
+    manifest_path = log_root / "profile_manifest.json"
+    if not manifest_path.exists():
+        return None
+    return load_json(manifest_path)
+
+
+def missing_manifest_steps(
+    manifest: JsonObject | None, records: Sequence[JsonObject]
+) -> list[JsonObject]:
+    if manifest is None:
+        return []
+    profile_run_id = manifest.get("profile_run_id")
+    if not isinstance(profile_run_id, str):
+        return [invalid_manifest("profile_manifest.json has no valid profile_run_id")]
+    profile_step_keys = result_profile_step_keys(records)
+    steps = manifest.get("steps")
+    missing_steps: list[JsonObject] = []
+    if not isinstance(steps, list):
+        return [
+            {
+                "id": "profile-manifest",
+                "label": "profile_manifest.json",
+                "title": "profile_manifest.json has no valid steps list",
+                "required": True,
+            }
+        ]
+    for step_number, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            missing_steps.append(malformed_manifest_step(step_number))
+            continue
+        step_id = step.get("id")
+        label = step.get("label")
+        profile_step_fingerprint = step.get("profile_step_fingerprint")
+        if not (
+            isinstance(step_id, str)
+            and isinstance(label, str)
+            and isinstance(profile_step_fingerprint, str)
+        ):
+            missing_steps.append(malformed_manifest_step(step_number))
+            continue
+        if (
+            profile_run_id,
+            step_id,
+            label,
+            profile_step_fingerprint,
+        ) not in profile_step_keys:
+            missing_steps.append(
+                {
+                    "id": step_id,
+                    "label": label,
+                    "title": str(step.get("title", "")),
+                    "required": step.get("required") is True,
+                }
+            )
+    return missing_steps
+
+
+def result_profile_step_keys(
+    records: Sequence[JsonObject],
+) -> set[tuple[str, str, str, str]]:
+    profile_step_keys: set[tuple[str, str, str, str]] = set()
+    for record in records:
+        profile_run_id = record.get("profile_run_id")
+        step_id = record.get("profile_step_id")
+        label = record.get("label")
+        profile_step_fingerprint = record.get("profile_step_fingerprint")
+        if (
+            isinstance(profile_run_id, str)
+            and isinstance(step_id, str)
+            and isinstance(label, str)
+            and isinstance(profile_step_fingerprint, str)
+        ):
+            profile_step_keys.add(
+                (profile_run_id, step_id, label, profile_step_fingerprint)
+            )
+    return profile_step_keys
+
+
+def invalid_manifest(title: str) -> JsonObject:
+    return {
+        "id": "profile-manifest",
+        "label": "profile_manifest.json",
+        "title": title,
+        "required": True,
+    }
+
+
+def malformed_manifest_step(step_number: int) -> JsonObject:
+    return {
+        "id": "profile-manifest",
+        "label": f"profile_manifest.json steps[{step_number}]",
+        "title": "profile_manifest.json contains malformed step entry",
+        "required": True,
+    }
 
 
 def run_report(log_root: Path, out_root: Path) -> int:
@@ -107,7 +219,20 @@ def run_report(log_root: Path, out_root: Path) -> int:
                 "error": "No result.json files found",
             }
         )
-    status, exit_code = final_status(results, read_errors)
+    profile_manifest: JsonObject | None = None
+    if log_root.exists():
+        try:
+            profile_manifest = load_profile_manifest(log_root)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            read_errors.append(
+                {
+                    "path": str(log_root / "profile_manifest.json"),
+                    "status": "FAIL",
+                    "error": str(error),
+                }
+            )
+    missing_steps = missing_manifest_steps(profile_manifest, results)
+    status, exit_code = final_status(results, read_errors, missing_steps)
     summary: JsonObject = {
         "status": status.value,
         "result": status.value,
@@ -120,6 +245,8 @@ def run_report(log_root: Path, out_root: Path) -> int:
         "out_root": str(out_root),
         "results": [cast(JsonValue, result) for result in results],
         "read_errors": [cast(JsonValue, read_error) for read_error in read_errors],
+        "missing_steps": [cast(JsonValue, step) for step in missing_steps],
+        "profile_manifest": profile_manifest or {},
         "supporting_artifacts": collect_supporting_artifacts(log_root, out_root)
         if log_root.exists()
         else {},
@@ -148,6 +275,10 @@ def collect_paths(log_root: Path, out_root: Path, pattern: str) -> list[JsonValu
 
 def markdown_report(summary: JsonObject) -> str:
     result_records = [record for record in cast(list[JsonObject], summary["results"])]
+    read_errors = [record for record in cast(list[JsonObject], summary["read_errors"])]
+    missing_steps = [
+        record for record in cast(list[JsonObject], summary["missing_steps"])
+    ]
     lines = [
         "# Hardware Validation Readiness Report",
         "",
@@ -176,6 +307,51 @@ def markdown_report(summary: JsonObject) -> str:
         lines.append(
             "| WARN | no result files | 0 | 1 | 2 | No validation result files found. |"
         )
+    if missing_steps:
+        lines.extend(
+            [
+                "",
+                "## Missing Required Steps",
+                "",
+                "| Required | Step | Label | Title |",
+                "|---|---|---|---|",
+            ]
+        )
+        for step in missing_steps:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(step.get("required", "")),
+                        markdown_cell(str(step.get("id", ""))),
+                        markdown_cell(str(step.get("label", ""))),
+                        markdown_cell(str(step.get("title", ""))),
+                    ]
+                )
+                + " |"
+            )
+    if read_errors:
+        lines.extend(
+            [
+                "",
+                "## Read Errors",
+                "",
+                "| Status | Path | Error |",
+                "|---|---|---|",
+            ]
+        )
+        for read_error in read_errors:
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        markdown_cell(str(read_error.get("status", ""))),
+                        markdown_cell(str(read_error.get("path", ""))),
+                        markdown_cell(str(read_error.get("error", ""))),
+                    ]
+                )
+                + " |"
+            )
     return "\n".join(lines) + "\n"
 
 

@@ -44,6 +44,117 @@ def test_readiness_status_matrix() -> None:
         )
 
 
+def test_readiness_fails_when_profile_manifest_step_is_missing() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        write_profile_manifest(root, "missing-system-stress")
+        assert run_report(write_result(root, "PASS", 0), root / "readiness") == 1
+        assert "missing-system-stress" in (
+            root / "readiness" / "readiness_report.md"
+        ).read_text(encoding="utf-8")
+
+
+def test_readiness_requires_matching_profile_step_fingerprint() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        write_profile_manifest(root, "system-stress", "expected-fingerprint")
+        _ = write_result(root, "PASS", 0, label="system-stress")
+        assert run_report(root, root / "readiness") == 1
+        assert "system-stress" in (
+            root / "readiness" / "readiness_report.md"
+        ).read_text(encoding="utf-8")
+
+
+def test_readiness_accepts_matching_profile_manifest_step() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        write_profile_manifest(root, "system-stress", "expected-fingerprint")
+        _ = write_result(
+            root,
+            "PASS",
+            0,
+            label="system-stress",
+            profile_step_id="system-stress",
+            profile_step_fingerprint="expected-fingerprint",
+            profile_run_id="current-run",
+        )
+        assert run_report(root, root / "readiness") == 0
+
+
+def test_readiness_rejects_matching_step_from_old_profile_run() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        write_profile_manifest(root, "system-stress", "expected-fingerprint")
+        _ = write_result(
+            root,
+            "PASS",
+            0,
+            label="system-stress",
+            profile_step_id="system-stress",
+            profile_step_fingerprint="expected-fingerprint",
+            profile_run_id="old-run",
+        )
+        assert run_report(root, root / "readiness") == 1
+
+
+def test_readiness_markdown_renders_read_errors() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        bad_result_directory = root / "bad"
+        bad_result_directory.mkdir()
+        _ = (bad_result_directory / "result.json").write_text(
+            "not json", encoding="utf-8"
+        )
+        assert run_report(root, root / "readiness") == 1
+        assert "Read Errors" in (root / "readiness" / "readiness_report.md").read_text(
+            encoding="utf-8"
+        )
+
+
+def test_readiness_reports_corrupt_profile_manifest() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        _ = (root / "profile_manifest.json").write_text("not json", encoding="utf-8")
+        _ = write_result(root, "PASS", 0)
+        assert run_report(root, root / "readiness") == 1
+        assert "profile_manifest.json" in (
+            root / "readiness" / "readiness_report.md"
+        ).read_text(encoding="utf-8")
+
+
+def test_readiness_fails_on_malformed_profile_manifest_steps() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        _ = (root / "profile_manifest.json").write_text(
+            json.dumps({"profile_run_id": "current-run", "steps": "not-a-list"}),
+            encoding="utf-8",
+        )
+        _ = write_result(root, "PASS", 0)
+        assert run_report(root, root / "readiness") == 1
+        assert "profile_manifest.json has no valid steps list" in (
+            root / "readiness" / "readiness_report.md"
+        ).read_text(encoding="utf-8")
+
+
+def test_readiness_fails_on_malformed_profile_manifest_step_entries() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        _ = (root / "profile_manifest.json").write_text(
+            json.dumps(
+                {
+                    "profile_run_id": "current-run",
+                    "steps": ["not-an-object", {"label": "missing-id"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        _ = write_result(root, "PASS", 0)
+        assert run_report(root, root / "readiness") == 1
+        assert "profile_manifest.json contains malformed step entry" in (
+            root / "readiness" / "readiness_report.md"
+        ).read_text(encoding="utf-8")
+
+
 def test_triage_ignores_inventory_metadata_and_benign_negative_lines() -> None:
     with tempfile.TemporaryDirectory() as directory_text:
         root = Path(directory_text)
@@ -103,21 +214,56 @@ def write_named_log(root: Path, relative_path: str, text: str) -> None:
     assert log_path.read_text(encoding="utf-8") == text
 
 
-def write_result(root: Path, status: str, exit_code: int) -> Path:
-    result_directory = root / "component"
-    result_directory.mkdir(parents=True)
-    payload = (
+def write_profile_manifest(
+    root: Path, label: str, profile_step_fingerprint: str = "expected-fingerprint"
+) -> None:
+    _ = (root / "profile_manifest.json").write_text(
         json.dumps(
             {
-                "status": status,
-                "result": status,
-                "exit_code": exit_code,
-                "failures": 1 if status == "FAIL" else 0,
-                "warnings": 1 if status == "WARN" else 0,
+                "manifest_version": 1,
+                "profile_run_id": "current-run",
+                "steps": [
+                    {
+                        "id": "system-stress",
+                        "label": label,
+                        "profile_step_fingerprint": profile_step_fingerprint,
+                        "title": "System stress",
+                        "required": True,
+                    }
+                ],
             }
-        )
-        + "\n"
+        ),
+        encoding="utf-8",
     )
+
+
+def write_result(
+    root: Path,
+    status: str,
+    exit_code: int,
+    label: str | None = None,
+    profile_step_id: str | None = None,
+    profile_step_fingerprint: str | None = None,
+    profile_run_id: str | None = None,
+) -> Path:
+    result_directory = root / "component"
+    result_directory.mkdir(parents=True)
+    result_payload = {
+        "status": status,
+        "result": status,
+        "exit_code": exit_code,
+        "failures": 1 if status == "FAIL" else 0,
+        "warnings": 1 if status == "WARN" else 0,
+    }
+    if label is not None:
+        result_payload["label"] = label
+    if profile_step_id is not None:
+        result_payload["profile_step_id"] = profile_step_id
+    if profile_step_fingerprint is not None:
+        result_payload["profile_step_fingerprint"] = profile_step_fingerprint
+    if profile_run_id is not None:
+        result_payload["profile_run_id"] = profile_run_id
+    payload = json.dumps(result_payload) + "\n"
     result_path = result_directory / "result.json"
     _ = result_path.write_text(payload, encoding="utf-8")
     assert result_path.read_text(encoding="utf-8") == payload
