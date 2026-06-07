@@ -5,7 +5,7 @@ from typing import Annotated
 import typer
 
 from hw_validation import __version__
-from hw_validation.console import console, failure, info
+from hw_validation.console import console, failure, info, warning
 from hw_validation.disk import run_disk_audit, run_disk_burnin, run_disk_monitor
 from hw_validation.filesystem import run_filesystem_scratch
 from hw_validation.network import run_network_burnin
@@ -428,6 +428,12 @@ def readiness_report(
 def exit_with(exit_code: int) -> None:
     if exit_code == 0:
         info("RESULT=PASS")
+    elif exit_code == ExitCode.warning.code:
+        warning("RESULT=WARN")
+    elif exit_code == ExitCode.hard_failure.code:
+        failure("RESULT=FAIL")
+    else:
+        failure(f"RESULT=ERROR exit_code={exit_code}")
     raise typer.Exit(exit_code)
 
 

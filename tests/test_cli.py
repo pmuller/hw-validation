@@ -50,3 +50,16 @@ def test_setup_runs_noninteractive_package_install(
     monkeypatch.setattr(cli, "run_setup", run_setup)
     assert CliRunner().invoke(application, ["setup", "--dry-run"]).exit_code == 0
     assert calls == [(False, True)]
+
+
+def test_logs_triage_prints_fail_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    def run_triage(log_root: object, out_root: object) -> int:
+        _ = (log_root, out_root)
+        return 1
+
+    monkeypatch.setattr(cli, "run_triage", run_triage)
+    result = CliRunner().invoke(
+        application,
+        ["logs", "triage", "--log-root", "/tmp", "--out-root", "/tmp/out"],
+    )
+    assert (result.exit_code, "RESULT=FAIL" in result.output) == (1, True)

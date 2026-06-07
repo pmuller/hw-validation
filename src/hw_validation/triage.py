@@ -28,7 +28,15 @@ PATTERNS = (
         "failure",
         re.compile(r"machine check exception", re.IGNORECASE),
     ),
-    TriagePattern("mce", "cpu", "failure", re.compile(r"\bMCE\b", re.IGNORECASE)),
+    TriagePattern(
+        "mce",
+        "cpu",
+        "failure",
+        re.compile(
+            r"\bMCE\b.*(?:error|exception|hardware)|(?:error|exception|hardware).*\bMCE\b",
+            re.IGNORECASE,
+        ),
+    ),
     TriagePattern(
         "hardware_error",
         "hardware",
@@ -53,7 +61,6 @@ PATTERNS = (
             re.IGNORECASE,
         ),
     ),
-    TriagePattern("edac", "memory", "warning", re.compile(r"\bEDAC\b", re.IGNORECASE)),
     TriagePattern(
         "pcie_aer_fatal",
         "pcie",
@@ -189,6 +196,24 @@ PATTERNS = (
         re.compile(r"network.*driver.*reset|NIC.*reset|adapter.*reset", re.IGNORECASE),
     ),
 )
+TRIAGE_FILE_MARKERS = (
+    "badblocks",
+    "dmesg",
+    "edac",
+    "fio",
+    "journal",
+    "kernel",
+    "mcelog",
+    "nvme",
+    "ras",
+    "smartctl",
+)
+TRIAGE_EXCLUDED_SUFFIXES = (".meta.json",)
+BENIGN_LINE_PATTERNS = (
+    re.compile(r"\bno\s+mce\s+errors?\b", re.IGNORECASE),
+    re.compile(r"\bno\s+errors?\s+to\s+report\b", re.IGNORECASE),
+    re.compile(r"\bedac drivers are loaded\b", re.IGNORECASE),
+)
 
 
 def finding(
@@ -208,10 +233,23 @@ def scan_file(file_path: Path) -> list[JsonObject]:
     findings: list[JsonObject] = []
     with file_path.open("r", encoding="utf-8", errors="replace") as log_file:
         for line_number, line in enumerate(log_file, start=1):
+            if benign_line(line):
+                continue
             for pattern in PATTERNS:
                 if pattern.expression.search(line):
                     findings.append(finding(pattern, file_path, line_number, line))
     return findings
+
+
+def benign_line(line: str) -> bool:
+    return any(pattern.search(line) for pattern in BENIGN_LINE_PATTERNS)
+
+
+def triage_candidate(file_path: Path) -> bool:
+    path_text = str(file_path).lower()
+    if any(path_text.endswith(suffix) for suffix in TRIAGE_EXCLUDED_SUFFIXES):
+        return False
+    return any(marker in path_text for marker in TRIAGE_FILE_MARKERS)
 
 
 def scan_logs(log_root: Path, out_root: Path) -> list[JsonObject]:
@@ -219,7 +257,11 @@ def scan_logs(log_root: Path, out_root: Path) -> list[JsonObject]:
         raise FileNotFoundError(f"--log-root does not exist: {log_root}")
     findings: list[JsonObject] = []
     for file_path in sorted(log_root.rglob("*")):
-        if file_path.is_dir() or path_is_within(file_path, out_root):
+        if (
+            file_path.is_dir()
+            or path_is_within(file_path, out_root)
+            or not triage_candidate(file_path)
+        ):
             continue
         try:
             findings.extend(scan_file(file_path))
