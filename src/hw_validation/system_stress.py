@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 
+from hw_validation.files import write_text
 from hw_validation.parsing import duration_seconds
 from hw_validation.paths import ensure_directory, slug
 from hw_validation.plan import (
@@ -137,7 +138,7 @@ def run_system_stress(
         ).ok
     ):
         failures += 1
-    collect_snapshot(runner, run_directory / "after")
+    collect_snapshot(runner, run_directory / "after", started_at)
     kernel_failures, kernel_warnings = scan_kernel_logs(
         run_directory / "after", allow_corrected_ecc, allow_thermal_throttle
     )
@@ -192,7 +193,9 @@ def memory_megabytes(mem_percent: int) -> int:
     return 1
 
 
-def collect_snapshot(runner: CommandRunner, snapshot_directory: Path) -> None:
+def collect_snapshot(
+    runner: CommandRunner, snapshot_directory: Path, started_at: str | None = None
+) -> None:
     ensure_directory(snapshot_directory)
     _ = runner.stream(
         "journal_kernel",
@@ -206,6 +209,23 @@ def collect_snapshot(runner: CommandRunner, snapshot_directory: Path) -> None:
         snapshot_directory / "dmesg.log",
         snapshot_directory / "dmesg.stderr",
     )
+    if started_at is not None:
+        since_start_result = runner.stream(
+            "journal_kernel_since_start",
+            [
+                "journalctl",
+                "-k",
+                "--since",
+                started_at,
+                "--no-pager",
+                "-o",
+                "short-iso-precise",
+            ],
+            snapshot_directory / "kernel_journal_since_start.log",
+            snapshot_directory / "kernel_journal_since_start.stderr",
+        )
+        if since_start_result.ok:
+            write_text(snapshot_directory / "kernel_journal_since_start.ok", "ok\n")
     _ = runner.stream(
         "edac",
         ["edac-util", "--verbose"],
@@ -231,10 +251,7 @@ def scan_kernel_logs(
 ) -> tuple[int, int]:
     failures = 0
     warnings = 0
-    for log_path in (
-        snapshot_directory / "kernel_journal.log",
-        snapshot_directory / "dmesg.log",
-    ):
+    for log_path in system_stress_kernel_scan_paths(snapshot_directory):
         text = (
             log_path.read_text(encoding="utf-8", errors="replace")
             if log_path.exists()
@@ -256,6 +273,13 @@ def scan_kernel_logs(
             else:
                 failures += 1
     return failures, warnings
+
+
+def system_stress_kernel_scan_paths(snapshot_directory: Path) -> tuple[Path, ...]:
+    kernel_journal_since_start = snapshot_directory / "kernel_journal_since_start.log"
+    if (snapshot_directory / "kernel_journal_since_start.ok").exists():
+        return (kernel_journal_since_start,)
+    return (snapshot_directory / "kernel_journal.log", snapshot_directory / "dmesg.log")
 
 
 def result_status_for_code(exit_code: int) -> ResultStatus:

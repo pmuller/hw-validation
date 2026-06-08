@@ -714,12 +714,31 @@ def nvme_current_operation(text: str) -> str:
 
 
 def nvme_selftest_passed(text: str) -> bool:
-    lowered = text.lower()
+    latest_result = nvme_latest_selftest_result(text).lower()
     return (
-        "failed" not in lowered
-        and "aborted" not in lowered
+        bool(latest_result)
         and nvme_selftest_complete(text)
+        and not any(outcome in latest_result for outcome in ("failed", "aborted"))
     )
+
+
+def nvme_latest_selftest_result(text: str) -> str:
+    lines = text.splitlines()
+    for line_index, line in enumerate(lines):
+        if not nvme_selftest_result_line(line):
+            continue
+        result_lines = [line]
+        for following_line in lines[line_index + 1 :]:
+            if nvme_selftest_result_line(following_line):
+                break
+            result_lines.append(following_line)
+        return "\n".join(result_lines)
+    return ""
+
+
+def nvme_selftest_result_line(line: str) -> bool:
+    line_text = line.lower().replace("-", " ")
+    return "self" in line_text and "test" in line_text and "result" in line_text
 
 
 def run_full_write_verify(
@@ -1213,9 +1232,10 @@ def capture_monitor_smart(
 
 
 def capture_monitor_sensors(runner: CommandRunner, run_directory: Path) -> None:
+    timestamp = utc_stamp()
     _ = runner.stream(
         "sensors_json",
         ["sensors", "-j"],
-        run_directory / f"sensors_{utc_stamp()}.json",
-        run_directory / f"sensors_{utc_stamp()}.stderr",
+        run_directory / f"sensors_{timestamp}.json",
+        run_directory / f"sensors_{timestamp}.stderr",
     )

@@ -634,6 +634,46 @@ def test_profile_run_executes_selected_step_and_writes_report(
         ]
 
 
+def test_profile_run_records_sequential_step_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        out_root = Path(directory_text)
+
+        def run_system_audit(out_root: Path, label: str) -> int:
+            _ = (out_root, label)
+            raise ValueError("audit collector failed")
+
+        monkeypatch.setattr(profile_module, "run_system_audit", run_system_audit)
+        monkeypatch.setattr(profile_module, "run_triage", pass_report)
+        monkeypatch.setattr(profile_module, "run_report", pass_report)
+        assert (
+            run_profile(
+                ProfileSettings(
+                    profile=ProfileName.smoke,
+                    speed=ProfileSpeed.smoke,
+                    out_root=out_root,
+                    parts=("system-audit-pre",),
+                    scratch_path=None,
+                    server=None,
+                    interface=None,
+                    devices=(),
+                    smartctl_type=None,
+                    erase_ok=False,
+                    cleanup=True,
+                    plan_only=False,
+                    resume=False,
+                )
+            )
+            == 1
+        )
+        steps = cast(list[JsonObject], json_object(out_root / "report.json")["steps"])
+        assert (steps[0]["status"], steps[0]["error"]) == (
+            "FAIL",
+            "audit collector failed",
+        )
+
+
 def test_profile_resume_skips_matching_pass_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -30,6 +30,15 @@ def test_triage_status_matrix() -> None:
         )
 
 
+def test_triage_missing_log_root_writes_failure_result() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        root = Path(directory_text)
+        assert run_triage(root / "missing", root / "out") == 1
+        assert json.loads((root / "out" / "result.json").read_text(encoding="utf-8"))[
+            "counts_by_pattern"
+        ] == {"log_root_error": 1}
+
+
 def test_readiness_status_matrix() -> None:
     with tempfile.TemporaryDirectory() as directory_text:
         root = Path(directory_text)

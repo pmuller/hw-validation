@@ -311,7 +311,11 @@ def run_triage(log_root: Path, out_root: Path) -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     started_monotonic = time.monotonic()
     started_at = utc_now()
-    findings = scan_logs(log_root, out_root)
+    findings: list[JsonObject]
+    try:
+        findings = scan_logs(log_root, out_root)
+    except (FileNotFoundError, PermissionError, OSError) as error:
+        findings = [log_root_error_finding(log_root, error)]
     status, exit_code = status_for(findings)
     summary: JsonObject = {
         "status": status.value,
@@ -337,6 +341,17 @@ def run_triage(log_root: Path, out_root: Path) -> int:
     write_json(out_root / "result.json", summary)
     write_text(out_root / "triage_summary.md", markdown_summary(summary, findings))
     return exit_code
+
+
+def log_root_error_finding(log_root: Path, error: OSError) -> JsonObject:
+    return {
+        "file_path": str(log_root),
+        "line_number": 0,
+        "severity": "failure",
+        "category": "log-root",
+        "pattern": "log_root_error",
+        "matched_text": str(error),
+    }
 
 
 def markdown_summary(summary: JsonObject, findings: Sequence[JsonObject]) -> str:

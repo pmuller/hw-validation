@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
+import hw_validation.disk as disk_module
 from hw_validation.disk import (
     block_metrics,
+    capture_monitor_sensors,
     discover_monitor_devices,
     monitor_device_name,
     monitor_required_commands,
@@ -71,6 +73,51 @@ def test_selftest_parsers() -> None:
         nvme_selftest_complete("Current operation: 0x1"),
         nvme_selftest_passed("Current operation: 0\nSelf-test Result: 0"),
     ) == (True, True, "0x1", True, False, True)
+
+
+def test_nvme_selftest_passed_ignores_historical_failure_entries() -> None:
+    assert nvme_selftest_passed(
+        "\n".join(
+            (
+                "Current operation: 0",
+                "Self Test Result[0]:",
+                "  Operation Result: 0x0 Operation completed without error",
+                "Self Test Result[1]:",
+                "  Operation Result: 0x4 Operation failed",
+            )
+        )
+    )
+
+
+def test_capture_monitor_sensors_uses_one_timestamp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        stream_paths: list[tuple[Path | None, Path | None]] = []
+
+        def utc_stamp() -> str:
+            return "20260608T120000Z"
+
+        def stream(
+            runner: CommandRunner,
+            name: str,
+            command: Sequence[str],
+            stdout_path: Path | None = None,
+            stderr_path: Path | None = None,
+        ) -> CommandResult:
+            _ = (runner, name)
+            stream_paths.append((stdout_path, stderr_path))
+            return CommandResult(tuple(command), 0, "", "", "start", "end", 0.0)
+
+        monkeypatch.setattr(disk_module, "utc_stamp", utc_stamp)
+        monkeypatch.setattr(CommandRunner, "stream", stream)
+        capture_monitor_sensors(CommandRunner(verbose=False), Path(directory_text))
+        assert stream_paths == [
+            (
+                Path(directory_text) / "sensors_20260608T120000Z.json",
+                Path(directory_text) / "sensors_20260608T120000Z.stderr",
+            )
+        ]
 
 
 def test_block_metrics_uses_sample_interval() -> None:

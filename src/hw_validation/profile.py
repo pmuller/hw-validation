@@ -686,7 +686,10 @@ def run_profile_step(
         info(f"SKIP {step.label}: existing PASS result")
         return skipped_profile_step_run(settings.out_root, step, profile_run_id)
     info(f"PROFILE RUN {step.label}: {step.title}")
-    exit_code = execute_profile_step(settings, step)
+    try:
+        exit_code = execute_profile_step(settings, step)
+    except Exception as error:
+        return failed_profile_step_run(step, str(error))
     annotate_profile_step_result(settings.out_root, step, profile_run_id, False)
     return profile_step_run(settings.out_root, step, exit_code, False, profile_run_id)
 
