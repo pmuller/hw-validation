@@ -3,8 +3,9 @@ from __future__ import annotations
 import shlex
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from os import environ
 from pathlib import Path
 from typing import cast
 
@@ -42,6 +43,7 @@ class CommandRunner:
         command: Sequence[str],
         timeout_seconds: float | None = None,
         check: bool = False,
+        environment: Mapping[str, str] | None = None,
     ) -> CommandResult:
         command_tuple = tuple(command)
         command_text = shlex.join(command_tuple)
@@ -60,6 +62,7 @@ class CommandRunner:
                 capture_output=True,
                 timeout=timeout_seconds,
                 errors="replace",
+                env=None if environment is None else environ | dict(environment),
                 check=False,
             )
         except OSError as error:

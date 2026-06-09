@@ -44,6 +44,11 @@ PACKAGE_SET = (
     "procps",
     "kmod",
 )
+APT_INSTALL_ENVIRONMENT = {
+    "DEBIAN_FRONTEND": "noninteractive",
+    "DEBCONF_NONINTERACTIVE_SEEN": "true",
+    "APT_LISTCHANGES_FRONTEND": "none",
+}
 
 REQUIRED_COMMANDS = (
     "bash",
@@ -168,7 +173,12 @@ def install_debian_tools(no_update: bool, dry_run: bool) -> None:
         )
     if not no_update:
         _ = runner.capture("apt_update", ["apt-get", "update"], check=True)
-    _ = runner.capture("apt_install", apt_install_command(), check=True)
+    _ = runner.capture(
+        "apt_install",
+        apt_install_command(),
+        check=True,
+        environment=APT_INSTALL_ENVIRONMENT,
+    )
 
 
 def apt_install_command(packages: tuple[str, ...] = PACKAGE_SET) -> tuple[str, ...]:
