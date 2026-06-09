@@ -213,6 +213,7 @@ BENIGN_LINE_PATTERNS = (
     re.compile(r"\bno\s+mce\s+errors?\b", re.IGNORECASE),
     re.compile(r"\bno\s+errors?\s+to\s+report\b", re.IGNORECASE),
     re.compile(r"\bedac drivers are loaded\b", re.IGNORECASE),
+    re.compile(r"\bnmi watchdog:\s+enabled\b", re.IGNORECASE),
 )
 
 

@@ -186,6 +186,11 @@ def test_triage_ignores_inventory_metadata_and_benign_negative_lines() -> None:
             "system-audit/0015_edac_verbose.stdout",
             "edac-util: No errors to report.\n",
         )
+        write_named_log(
+            root,
+            "disk-audit/0003_dmesg.stdout",
+            "NMI watchdog: Enabled. Permanently consumes one hw-PMU counter.\n",
+        )
         assert run_triage(root, root / "out") == 0
 
 
