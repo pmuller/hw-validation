@@ -83,6 +83,7 @@ class ProfileSettings:
     plan_only: bool
     resume: bool
     all_devices: bool = False
+    excluded_devices: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,6 +485,7 @@ def profile_manifest(
         "out_root": str(settings.out_root),
         "parts": [part for part in settings.parts],
         "devices": [device for device in settings.devices],
+        "excluded_devices": [device for device in settings.excluded_devices],
         "all_devices": settings.all_devices,
         "plan_only": settings.plan_only,
         "resume": settings.resume,
@@ -553,9 +555,23 @@ def resolve_profile_settings(settings: ProfileSettings) -> ProfileSettings:
     discovered_devices = discover_profile_burnin_devices(settings.out_root)
     if not discovered_devices:
         raise ValueError("--all-devices discovered no eligible disks")
+    excluded_devices = discover_profile_rootfs_devices(settings.out_root)
+    info(
+        "EXCLUDE rootfs-backed disks from --all-devices: " + ", ".join(excluded_devices)
+    )
+    if excluded_devices:
+        discovered_devices = exclude_profile_devices(
+            discovered_devices, excluded_devices
+        )
+    if not discovered_devices:
+        raise ValueError(
+            "--all-devices discovered no eligible disks after excluding "
+            + "rootfs-backed disks"
+        )
     return replace(
         settings,
         devices=discovered_devices,
+        excluded_devices=excluded_devices,
     )
 
 
@@ -568,6 +584,65 @@ def discover_profile_burnin_devices(out_root: Path) -> tuple[str, ...]:
         for device in discover_devices(
             CommandRunner(discovery_directory), (), True, False, False
         )
+    )
+
+
+def discover_profile_rootfs_devices(out_root: Path) -> tuple[str, ...]:
+    require_commands(("findmnt", "lsblk"))
+    discovery_directory = out_root / "profile-discovery" / f"{utc_stamp()}_rootfs"
+    ensure_directory(discovery_directory)
+    runner = CommandRunner(discovery_directory)
+    root_source_result = runner.capture(
+        "rootfs_source", ["findmnt", "-n", "-o", "SOURCE", "/"]
+    )
+    if not root_source_result.ok:
+        raise RuntimeError("could not identify root filesystem source")
+    root_source = next(
+        (
+            line.strip()
+            for line in root_source_result.stdout.splitlines()
+            if line.strip()
+        ),
+        "",
+    )
+    if not root_source:
+        raise RuntimeError("could not identify root filesystem source")
+    dependency_result = runner.capture(
+        "rootfs_dependencies", ["lsblk", "-rspno", "NAME,TYPE", root_source]
+    )
+    if not dependency_result.ok:
+        raise RuntimeError(f"could not identify root filesystem disk for {root_source}")
+    rootfs_devices = rootfs_disk_devices_from_lsblk(dependency_result.stdout)
+    if not rootfs_devices:
+        raise RuntimeError(f"could not identify root filesystem disk for {root_source}")
+    return rootfs_devices
+
+
+def rootfs_disk_devices_from_lsblk(text: str) -> tuple[str, ...]:
+    devices: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        columns = line.split()
+        if len(columns) < 2 or columns[-1] != "disk":
+            continue
+        device_start = columns[0].find("/dev/")
+        if device_start < 0:
+            continue
+        device = str(Path(columns[0][device_start:]).resolve(strict=False))
+        if device not in seen:
+            devices.append(device)
+            seen.add(device)
+    return tuple(devices)
+
+
+def exclude_profile_devices(
+    devices: tuple[str, ...], excluded_devices: tuple[str, ...]
+) -> tuple[str, ...]:
+    excluded = {str(Path(device).resolve(strict=False)) for device in excluded_devices}
+    return tuple(
+        device
+        for device in devices
+        if str(Path(device).resolve(strict=False)) not in excluded
     )
 
 

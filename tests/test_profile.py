@@ -16,7 +16,9 @@ from hw_validation.profile import (
     ProfileStep,
     ProfileStepId,
     build_profile_steps,
+    exclude_profile_devices,
     parse_parts,
+    rootfs_disk_devices_from_lsblk,
     run_profile,
 )
 
@@ -212,10 +214,19 @@ def test_disk_burnin_all_devices_plan_expands_discovered_devices(
         _ = out_root
         return ("/dev/sda", "/dev/nvme0n1")
 
+    def discover_profile_rootfs_devices(out_root: Path) -> tuple[str, ...]:
+        _ = out_root
+        return ("/dev/sda",)
+
     monkeypatch.setattr(
         profile_module,
         "discover_profile_burnin_devices",
         discover_profile_burnin_devices,
+    )
+    monkeypatch.setattr(
+        profile_module,
+        "discover_profile_rootfs_devices",
+        discover_profile_rootfs_devices,
     )
     with tempfile.TemporaryDirectory() as directory_text:
         out_root = Path(directory_text)
@@ -245,14 +256,146 @@ def test_disk_burnin_all_devices_plan_expands_discovered_devices(
         )
         assert [step["label"] for step in steps] == [
             "disk-burnin-disk-audit",
-            "disk-burnin-disk-burnin-sda",
             "disk-burnin-disk-burnin-nvme0n1",
         ]
         assert [step.get("target_device", "") for step in steps] == [
             "",
-            "/dev/sda",
             "/dev/nvme0n1",
         ]
+
+
+def test_disk_burnin_all_devices_filters_rootfs_from_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def discover_profile_burnin_devices(out_root: Path) -> tuple[str, ...]:
+        _ = out_root
+        return ("/dev/sda", "/dev/sdb", "/dev/nvme0n1")
+
+    def discover_profile_rootfs_devices(out_root: Path) -> tuple[str, ...]:
+        _ = out_root
+        return ("/dev/sda",)
+
+    messages: list[str] = []
+
+    def info(message: str) -> None:
+        messages.append(message)
+
+    monkeypatch.setattr(
+        profile_module,
+        "discover_profile_burnin_devices",
+        discover_profile_burnin_devices,
+    )
+    monkeypatch.setattr(
+        profile_module,
+        "discover_profile_rootfs_devices",
+        discover_profile_rootfs_devices,
+    )
+    monkeypatch.setattr(profile_module, "info", info)
+    with tempfile.TemporaryDirectory() as directory_text:
+        out_root = Path(directory_text)
+        assert (
+            run_profile(
+                ProfileSettings(
+                    profile=ProfileName.disk_burnin,
+                    speed=ProfileSpeed.standard,
+                    out_root=out_root,
+                    parts=(),
+                    scratch_path=None,
+                    server=None,
+                    interface=None,
+                    devices=(),
+                    smartctl_type=None,
+                    erase_ok=False,
+                    cleanup=True,
+                    plan_only=True,
+                    resume=False,
+                    all_devices=True,
+                )
+            )
+            == 0
+        )
+        manifest = json_object(out_root / "profile_manifest.json")
+        steps = cast(list[JsonObject], manifest["steps"])
+        assert manifest["devices"] == ["/dev/sdb", "/dev/nvme0n1"]
+        assert manifest["excluded_devices"] == ["/dev/sda"]
+        assert messages[0] == "EXCLUDE rootfs-backed disks from --all-devices: /dev/sda"
+        assert [step["label"] for step in steps] == [
+            "disk-burnin-disk-audit",
+            "disk-burnin-disk-burnin-sdb",
+            "disk-burnin-disk-burnin-nvme0n1",
+        ]
+
+
+def test_disk_burnin_all_devices_reports_empty_after_rootfs_exclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def discover_profile_burnin_devices(out_root: Path) -> tuple[str, ...]:
+        _ = out_root
+        return ("/dev/sda",)
+
+    def discover_profile_rootfs_devices(out_root: Path) -> tuple[str, ...]:
+        _ = out_root
+        return ("/dev/sda",)
+
+    monkeypatch.setattr(
+        profile_module,
+        "discover_profile_burnin_devices",
+        discover_profile_burnin_devices,
+    )
+    monkeypatch.setattr(
+        profile_module,
+        "discover_profile_rootfs_devices",
+        discover_profile_rootfs_devices,
+    )
+    with (
+        tempfile.TemporaryDirectory() as directory_text,
+        pytest.raises(
+            ValueError,
+            match=(
+                "--all-devices discovered no eligible disks after excluding "
+                + "rootfs-backed disks"
+            ),
+        ),
+    ):
+        _ = run_profile(
+            ProfileSettings(
+                profile=ProfileName.disk_burnin,
+                speed=ProfileSpeed.standard,
+                out_root=Path(directory_text),
+                parts=(),
+                scratch_path=None,
+                server=None,
+                interface=None,
+                devices=(),
+                smartctl_type=None,
+                erase_ok=False,
+                cleanup=True,
+                plan_only=True,
+                resume=False,
+                all_devices=True,
+            )
+        )
+
+
+def test_rootfs_disk_devices_from_lsblk_parses_dependency_disks() -> None:
+    assert rootfs_disk_devices_from_lsblk(
+        "\n".join(
+            (
+                "/dev/mapper/vg-root lvm",
+                "/dev/sda2 part",
+                "/dev/sda disk",
+                "/dev/nvme0n1p2 part",
+                "\u2514\u2500/dev/nvme0n1 disk",
+                "/dev/sda disk",
+            )
+        )
+    ) == ("/dev/sda", "/dev/nvme0n1")
+
+
+def test_exclude_profile_devices_matches_resolved_paths() -> None:
+    assert exclude_profile_devices(
+        ("/dev/sda", "/dev/sdb", "/dev/nvme0n1"), ("/dev/sda",)
+    ) == ("/dev/sdb", "/dev/nvme0n1")
 
 
 def test_disk_burnin_all_devices_reports_empty_discovery(
@@ -341,6 +484,11 @@ def test_disk_burnin_all_devices_runs_each_discovered_device(
             profile_module,
             "discover_profile_burnin_devices",
             discover_profile_burnin_devices,
+        )
+        monkeypatch.setattr(
+            profile_module,
+            "discover_profile_rootfs_devices",
+            discover_non_candidate_rootfs_devices,
         )
         monkeypatch.setattr(profile_module, "run_disk_burnin", run_disk_burnin)
         monkeypatch.setattr(
@@ -433,6 +581,11 @@ def test_disk_burnin_all_devices_preflight_failure_writes_report(
         )
         monkeypatch.setattr(
             profile_module,
+            "discover_profile_rootfs_devices",
+            discover_non_candidate_rootfs_devices,
+        )
+        monkeypatch.setattr(
+            profile_module,
             "preflight_profile_burnin_target",
             preflight_profile_burnin_target,
         )
@@ -484,6 +637,11 @@ def test_disk_burnin_all_devices_preflight_failure_blocks_unfailed_steps(
             profile_module,
             "discover_profile_burnin_devices",
             discover_profile_burnin_devices,
+        )
+        monkeypatch.setattr(
+            profile_module,
+            "discover_profile_rootfs_devices",
+            discover_non_candidate_rootfs_devices,
         )
         monkeypatch.setattr(
             profile_module,
@@ -571,6 +729,11 @@ def test_disk_burnin_all_devices_records_parallel_failures(
             profile_module,
             "discover_profile_burnin_devices",
             discover_profile_burnin_devices,
+        )
+        monkeypatch.setattr(
+            profile_module,
+            "discover_profile_rootfs_devices",
+            discover_non_candidate_rootfs_devices,
         )
         monkeypatch.setattr(profile_module, "run_disk_burnin", run_disk_burnin)
         monkeypatch.setattr(
@@ -906,3 +1069,8 @@ def pass_report(log_root: Path, out_root: Path) -> int:
 
 def pass_preflight(settings: ProfileSettings, steps: tuple[ProfileStep, ...]) -> None:
     _ = (settings, steps)
+
+
+def discover_non_candidate_rootfs_devices(out_root: Path) -> tuple[str, ...]:
+    _ = out_root
+    return ("/dev/rootfs",)

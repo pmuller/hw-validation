@@ -105,7 +105,9 @@ Speeds apply only to bounded workloads such as stress, filesystem, network, and 
 
 Disk burn-in is not a speed. It is pass-bound and device-bound. A true burn-in for a large HDD can take a week or more.
 
-`--all-devices` is intentionally explicit. It discovers non-removable writable whole disks, writes each selected device into `profile_manifest.json`, runs the pre burn-in disk audit for those devices, preflights every selected disk for whole-disk, mounted descendant, active swap, and holder safety, then runs the destructive burn-in steps for the selected disks in parallel. Each disk is validated again by the normal per-device burn-in safety checks and per-device locking.
+`--all-devices` is intentionally explicit. It discovers non-removable writable whole disks, always removes disks backing the root filesystem before writing the plan, writes each selected device into `profile_manifest.json`, runs the pre burn-in disk audit for those devices, preflights every selected disk for whole-disk, mounted descendant, active swap, and holder safety, then runs the destructive burn-in steps for the selected disks in parallel. Each disk is validated again by the normal per-device burn-in safety checks and per-device locking.
+
+Review `profile_manifest.json` before running destructive work. Rootfs-backed disks are recorded in `excluded_devices` and logged during all-device discovery.
 
 `--all-devices` cannot be combined with `--resume`. Kernel device names are not stable enough to safely resume destructive all-device selection. If you need to resume after a partial all-device run, rerun the remaining disks explicitly with `--device /dev/disk/by-id/...`.
 
@@ -161,7 +163,7 @@ Useful profile controls:
 | `--resume` | Skip profile steps that already have a matching `PASS` result for the expected step fingerprint. Not allowed with `--all-devices`. |
 | `--parts` | Select only some parts. |
 | `--speed` | Override bounded workload durations. |
-| `--all-devices` | For `disk-burnin`, discover all eligible disks and burn them in concurrently. |
+| `--all-devices` | For `disk-burnin`, discover all eligible disks except rootfs-backed disks and burn them in concurrently. |
 
 Readiness automatically checks `profile_manifest.json` when it exists. Missing required profile steps are reported as missing coverage instead of being silently ignored.
 
