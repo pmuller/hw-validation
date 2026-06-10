@@ -65,6 +65,55 @@ def test_standard_profile_requires_external_inputs() -> None:
         )
 
 
+def test_filesystem_profile_requires_existing_scratch_path_for_real_run() -> None:
+    with (
+        tempfile.TemporaryDirectory() as directory_text,
+        pytest.raises(ValueError, match="--scratch-path must be an existing directory"),
+    ):
+        _ = run_profile(
+            ProfileSettings(
+                profile=ProfileName.standard,
+                speed=ProfileSpeed.standard,
+                out_root=Path(directory_text) / "out",
+                parts=("filesystem",),
+                scratch_path=Path(directory_text) / "missing-scratch",
+                server=None,
+                interface=None,
+                devices=(),
+                smartctl_type=None,
+                erase_ok=False,
+                cleanup=True,
+                plan_only=False,
+                resume=False,
+            )
+        )
+
+
+def test_filesystem_profile_plan_only_allows_future_scratch_path() -> None:
+    with tempfile.TemporaryDirectory() as directory_text:
+        out_root = Path(directory_text) / "out"
+        assert (
+            run_profile(
+                ProfileSettings(
+                    profile=ProfileName.standard,
+                    speed=ProfileSpeed.standard,
+                    out_root=out_root,
+                    parts=("filesystem",),
+                    scratch_path=Path(directory_text) / "future-scratch",
+                    server=None,
+                    interface=None,
+                    devices=(),
+                    smartctl_type=None,
+                    erase_ok=False,
+                    cleanup=True,
+                    plan_only=True,
+                    resume=False,
+                )
+            )
+            == 0
+        )
+
+
 def test_disk_burnin_profile_requires_device_even_for_plan_only() -> None:
     with (
         tempfile.TemporaryDirectory() as directory_text,

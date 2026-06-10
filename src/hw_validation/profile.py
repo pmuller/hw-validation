@@ -519,10 +519,13 @@ def validate_profile_settings(
     step_ids = {step.step_id for step in steps}
     if settings.all_devices and ProfileStepId.disk_burnin not in step_ids:
         raise ValueError("--all-devices is only valid when disk-burnin is selected")
-    if ProfileStepId.filesystem_scratch in step_ids and settings.scratch_path is None:
-        raise ValueError(
-            "--scratch-path is required when filesystem validation is selected"
-        )
+    if ProfileStepId.filesystem_scratch in step_ids:
+        if settings.scratch_path is None:
+            raise ValueError(
+                "--scratch-path is required when filesystem validation is selected"
+            )
+        if not settings.plan_only and not settings.scratch_path.is_dir():
+            raise ValueError("--scratch-path must be an existing directory")
     if ProfileStepId.network_burnin in step_ids and not settings.server:
         raise ValueError("--server is required when network validation is selected")
     if ProfileStepId.disk_burnin in step_ids:
